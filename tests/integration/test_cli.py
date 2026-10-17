@@ -765,6 +765,391 @@ def test_run_invokes_the_agent_and_records_the_outcome(project: Path, records: i
     assert record["exit_code"] == 0
 
 
+def test_run_uses_injected_execution_steps(project: Path) -> None:
+    events: list[str] = []
+    seen_workdirs: list[Path] = []
+
+    def run_agent(
+        selected: config.HarnessConfig,
+        text: str,
+        workdir: Path,
+        *,
+        model: str | None,
+        env: dict[str, str] | None,
+    ) -> harness.HarnessResult:
+        assert text
+        assert workdir.is_dir()
+        seen_workdirs.append(workdir)
+        session = workdir / "session"
+        session.mkdir()
+        events.append("run")
+        return harness.HarnessResult(
+            report=OutcomeReport(outcome=OutcomeStatus.RESOLVED, details="runner result"),
+            exit_code=0,
+            session_dir=session,
+        )
+
+    def capture(session: Path | None, destination: Path | None, item: str) -> None:
+        assert session is not None and session.is_dir()
+        assert destination is None
+        assert item == "VUL-1"
+        events.append("capture")
+
+    def verifier(report: OutcomeReport) -> OutcomeReport:
+        assert not seen_workdirs[0].exists()
+        events.append("verify")
+        return report.model_copy(update={"details": "checked result"})
+
+    record = cli.run_item(
+        config.load(project),
+        "vul",
+        "VUL-1",
+        source=FakeSource(items("VUL-1")),
+        runner=run_agent,
+        verifier=verifier,
+        capture=capture,
+    )
+    assert record is not None
+    assert record.report.details == "checked result"
+    assert events == ["run", "capture", "verify"]
+    assert not seen_workdirs[0].exists()
+
+
+@pytest.fixture(params=["project", "sweep_project"])
+def execution_case(request: pytest.FixtureRequest) -> tuple[Path, str, str | None]:
+    path = request.getfixturevalue(request.param)
+    return (path, "vul", "VUL-1") if request.param == "project" else (path, "reap", None)
+
+
+@pytest.mark.parametrize("session_present", [False, True])
+@pytest.mark.parametrize("destination_present", [False, True])
+@pytest.mark.parametrize("override", [None, "trial-model"])
+def test_run_injected_runner_receives_effective_inputs_and_capture_lifecycle(
+    execution_case: tuple[Path, str, str | None],
+    session_present: bool,
+    destination_present: bool,
+    override: str | None,
+) -> None:
+    path, track, item = execution_case
+    text = path.read_text().replace('"{outcome_dir}"]', '"{outcome_dir}", "{model}"]')
+    if destination_present:
+        text = text.replace(
+            'tracks_dir = "tracks"', 'tracks_dir = "tracks"\nartifacts_dir = "artifacts"'
+        )
+    path.write_text(text + f'\nmodel = "own-model"\n[{track}.env]\nLABEL = "triaged"\n')
+    loaded = config.load(path)
+    source = FakeSource(items("VUL-1"))
+    executor = FakeExecutor()
+    executor.url = "https://logs.example/run/1"
+    events: list[str] = []
+    workdirs: list[Path] = []
+    original = OutcomeReport(outcome=OutcomeStatus.RESOLVED, details="agent report")
+
+    def run_agent(
+        selected: config.HarnessConfig,
+        text: str,
+        workdir: Path,
+        *,
+        model: str | None,
+        env: dict[str, str] | None,
+    ) -> harness.HarnessResult:
+        assert selected == loaded.harness_config()
+        assert model == (override or "own-model")
+        assert env == {"LABEL": "triaged"}
+        assert str(harness.outcome_path(workdir)) in text
+        assert ("## Work item" in text) == (item is not None)
+        assert workdir.is_dir()
+        workdirs.append(workdir)
+        session = workdir / "session" if session_present else None
+        if session is not None:
+            session.mkdir()
+            (session / "evidence.txt").write_text("evidence")
+        events.append("run")
+        return harness.HarnessResult(original, 7, session)
+
+    def capture(session: Path | None, destination: Path | None, key: str) -> None:
+        assert workdirs[0].is_dir()
+        assert (session is not None) == session_present
+        if session is not None:
+            assert (session / "evidence.txt").read_text() == "evidence"
+        assert destination == (path.parent / "artifacts" if destination_present else None)
+        assert key == (item or "sweep")
+        events.append("capture")
+
+    def verifier(report: OutcomeReport) -> OutcomeReport:
+        assert report is original
+        assert not workdirs[0].exists()
+        events.append("verify")
+        return report.model_copy(update={"verified": False})
+
+    # All seven pre-existing parameters remain positional.
+    record = cli.run_item(
+        loaded,
+        track,
+        item,
+        source,
+        executor,
+        False,
+        override,
+        runner=run_agent,
+        verifier=verifier,
+        capture=capture,
+    )
+    assert record is not None
+    assert events == ["run", "capture", "verify"]
+    assert not workdirs[0].exists()
+    assert record.track == track and record.item == (item or "sweep")
+    assert record.exit_code == 7 and record.run_url == executor.url
+    assert record.report.outcome == OutcomeStatus.RESOLVED
+    assert record.report.details == original.details
+    assert record.report.verified is False and original.verified is None
+    assert record.effective_status == OutcomeStatus.NEEDS_HUMAN
+    assert record.duration_seconds >= 0
+    assert source.claims == ([item] if item else [])
+    assert source.rechecked == ([(item, "project = VUL")] if item else [])
+    assert source.annotations == source.blocked == []
+    assert loaded.track(track).model == "own-model"
+
+
+@pytest.mark.parametrize("hook", ["runner", "capture", "verifier"])
+def test_run_each_injected_hook_keeps_other_dynamic_defaults(
+    execution_case: tuple[Path, str, str | None],
+    hook: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, track, item = execution_case
+    with_session_capture(path)
+    outcome_written(
+        path,
+        {
+            "outcome": "resolved",
+            "details": "opened a PR",
+            "artifacts": [{"kind": "github:pr", "url": MISSING_ARTIFACT}],
+        },
+    )
+    real_run, real_capture, real_verify = harness.run, harness.capture, verify.verify
+    events: list[str] = []
+
+    def run_agent(*args: Any, **kwargs: Any) -> harness.HarnessResult:
+        events.append("injected runner")
+        return real_run(*args, **kwargs)
+
+    def capture(*args: Any, **kwargs: Any) -> None:
+        events.append("injected capture")
+        real_capture(*args, **kwargs)
+
+    def verifier(report: OutcomeReport) -> OutcomeReport:
+        events.append("injected verifier")
+        return real_verify(report)
+
+    def default_run(*args: Any, **kwargs: Any) -> harness.HarnessResult:
+        events.append("default runner")
+        return real_run(*args, **kwargs)
+
+    def default_capture(*args: Any, **kwargs: Any) -> None:
+        events.append("default capture")
+        real_capture(*args, **kwargs)
+
+    def default_verify(report: OutcomeReport) -> OutcomeReport:
+        events.append("default verifier")
+        return real_verify(report)
+
+    monkeypatch.setattr(harness, "run", default_run)
+    monkeypatch.setattr(harness, "capture", default_capture)
+    monkeypatch.setattr(verify, "verify", default_verify)
+    record = cli.run_item(
+        config.load(path),
+        track,
+        item,
+        source=FakeSource(items("VUL-1")),
+        runner=run_agent if hook == "runner" else None,
+        capture=capture if hook == "capture" else None,
+        verifier=verifier if hook == "verifier" else None,
+    )
+    assert events == [
+        f"{'injected' if name == hook else 'default'} {name}"
+        for name in ("runner", "capture", "verifier")
+    ]
+    assert record is not None
+    assert record.report.outcome == OutcomeStatus.RESOLVED
+    assert record.report.verified is False
+    assert record.effective_status == OutcomeStatus.NEEDS_HUMAN
+    assert (path.parent / "artifacts" / (item or "sweep") / "transcript.jsonl").read_text() == (
+        "turn one\n"
+    )
+
+
+@pytest.mark.parametrize("failure", ["runner", "capture", "verifier"])
+def test_run_injected_hook_exceptions_propagate_and_clean_workspace(
+    execution_case: tuple[Path, str, str | None],
+    failure: str,
+    records: io.StringIO,
+) -> None:
+    path, track, item = execution_case
+    if item is not None:
+        path.write_text(path.read_text() + '\non_failure = "annotate"\n')
+    source = FakeSource(items("VUL-1"))
+    events: list[str] = []
+    workdirs: list[Path] = []
+    error = RuntimeError("callback failed")
+
+    def step(name: str) -> None:
+        events.append(name)
+        if failure == name:
+            raise error
+
+    def run_agent(
+        selected: config.HarnessConfig,
+        text: str,
+        workdir: Path,
+        *,
+        model: str | None,
+        env: dict[str, str] | None,
+    ) -> harness.HarnessResult:
+        workdirs.append(workdir)
+        step("runner")
+        return harness.HarnessResult(OutcomeReport(outcome=OutcomeStatus.FAILED), 1)
+
+    def capture(session: Path | None, destination: Path | None, key: str) -> None:
+        assert workdirs[0].is_dir()
+        step("capture")
+
+    def verifier(report: OutcomeReport) -> OutcomeReport:
+        assert not workdirs[0].exists()
+        step("verifier")
+        return report
+
+    with pytest.raises(RuntimeError) as caught:
+        cli.run_item(
+            config.load(path),
+            track,
+            item,
+            source=source,
+            runner=run_agent,
+            capture=capture,
+            verifier=verifier,
+        )
+    assert caught.value is error
+    order = ["runner", "capture", "verifier"]
+    assert events == order[: order.index(failure) + 1]
+    assert not workdirs[0].exists()
+    assert source.annotations == source.blocked == []
+    assert not any(line["message"] == "run complete" for line in json_lines(records.getvalue()))
+
+
+@pytest.mark.parametrize("early", ["dry", "ineligible", "claim", "disabled", "missing-item"])
+def test_run_early_returns_call_no_injected_hooks(project: Path, early: str) -> None:
+    if early == "disabled":
+        project.write_text(project.read_text() + "\nenabled = false\n")
+    source = FakeSource(items("VUL-1"), matching=early != "ineligible", claimable=early != "claim")
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("an execution hook must not run")
+
+    def invoke() -> Any:
+        return cli.run_item(
+            config.load(project),
+            "vul",
+            None if early == "missing-item" else "VUL-1",
+            source=source,
+            dry_run=early == "dry",
+            runner=forbidden,
+            capture=forbidden,
+            verifier=forbidden,
+        )
+
+    if early in {"disabled", "missing-item"}:
+        with pytest.raises(config.ConfigError):
+            invoke()
+    else:
+        record = invoke()
+        if early == "dry":
+            assert record is None
+        else:
+            assert record.effective_status == OutcomeStatus.NO_ACTION_NEEDED
+            assert record.exit_code is None
+    assert source.claims == (["VUL-1"] if early == "claim" else [])
+    assert source.annotations == source.blocked == []
+
+
+@pytest.mark.parametrize("early", ["dry", "disabled", "unexpected-item"])
+def test_run_sweep_early_returns_call_no_injected_hooks(
+    sweep_project: Path,
+    no_source: None,
+    early: str,
+) -> None:
+    if early == "disabled":
+        sweep_project.write_text(sweep_project.read_text() + "\nenabled = false\n")
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("an execution hook must not run")
+
+    def invoke() -> Any:
+        return cli.run_item(
+            config.load(sweep_project),
+            "reap",
+            "VUL-1" if early == "unexpected-item" else None,
+            dry_run=early == "dry",
+            runner=forbidden,
+            capture=forbidden,
+            verifier=forbidden,
+        )
+
+    if early == "dry":
+        assert invoke() is None
+    else:
+        with pytest.raises(config.ConfigError):
+            invoke()
+
+
+@pytest.mark.parametrize("verified", [True, False, None])
+def test_run_injected_verifier_preserves_record_and_write_back(
+    annotating: Path,
+    records: io.StringIO,
+    verified: bool | None,
+) -> None:
+    outcome_written(annotating, {"outcome": "resolved", "details": "agent report"})
+
+    class RecordingSource(FakeSource):
+        def annotate(self, item: WorkItem, comment: str) -> None:
+            assert last_record(records.getvalue())["message"] == "run complete"
+            super().annotate(item, comment)
+
+    source = RecordingSource(items("VUL-1"))
+    executor = FakeExecutor()
+    executor.url = "https://logs.example/run/1"
+
+    def verifier(report: OutcomeReport) -> OutcomeReport:
+        assert report.outcome == OutcomeStatus.RESOLVED
+        return report.model_copy(update={"verified": verified})
+
+    record = cli.run_item(
+        config.load(annotating),
+        "vul",
+        "VUL-1",
+        source=source,
+        executor=executor,
+        verifier=verifier,
+    )
+    assert record is not None
+    logged = last_record(records.getvalue())
+    assert {key: logged[key] for key in type(record).model_fields} == record.model_dump(mode="json")
+    assert record.report.outcome == OutcomeStatus.RESOLVED
+    assert record.report.details == "agent report"
+    assert record.report.verified is verified
+    if verified is False:
+        assert record.effective_status == OutcomeStatus.NEEDS_HUMAN
+        assert source.blocked == ["VUL-1"]
+        assert len(source.annotations) == 1
+        key, comment = source.annotations[0]
+        assert key == "VUL-1"
+        assert "needs_human" in comment and "verification failed" in comment
+        assert "agent report" in comment and executor.url in comment
+    else:
+        assert record.effective_status == OutcomeStatus.RESOLVED
+        assert source.annotations == source.blocked == []
+
+
 def test_run_flips_the_status_when_an_artifact_is_missing(
     project: Path, records: io.StringIO
 ) -> None:
