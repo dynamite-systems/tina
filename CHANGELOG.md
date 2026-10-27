@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/dynamite-systems/tina/compare/v0.1.6...v0.1.7) (2026-10-27)
+
+
+### Features
+
+* allow callers to customize execution boundaries ([#113](https://github.com/dynamite-systems/tina/issues/113)) ([92c5eb3](https://github.com/dynamite-systems/tina/commit/92c5eb340ae4cc93888507159813e12d18e4e1cc))
+
 ## [0.1.6](https://github.com/raiderrobert/tina/compare/v0.1.5...v0.1.6) (2026-10-07)
 
 
