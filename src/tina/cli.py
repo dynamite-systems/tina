@@ -4,7 +4,7 @@ introspection commands around them. Two roles, one image.
 The typer commands are a thin shell: they parse argv, load config, and turn a
 `TinaError` into exit 1. The orchestration lives in `dispatch_track`,
 `run_item`, and `status_track`, which take already-built objects so callers
-(and tests) can inject a source, an executor, or a governor.
+(and tests) can inject a source, an executor, a governor, or execution callbacks.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from tina import validate as admission
 from tina.config import Config, ConfigError, TrackConfig
 from tina.config import load as load_config
 from tina.errors import TinaError
+from tina.execution import Capture, Runner, Verifier
 from tina.executors.base import Executor
 from tina.governor import Governor
 from tina.models import SWEEP_ITEM, OutcomeReport, OutcomeStatus, RunRecord, WorkItem
@@ -643,6 +644,10 @@ def run_item(
     executor: Executor | None = None,
     dry_run: bool = False,
     model: str | None = None,
+    *,
+    runner: Runner | None = None,
+    verifier: Verifier | None = None,
+    capture: Capture | None = None,
 ) -> RunRecord | None:
     """Claim one item, run the agent once, verify, record.
 
@@ -656,7 +661,12 @@ def run_item(
 
     Returns the record it logged. Every agent outcome is a successful run — the
     outcome is data, not a process failure — so this never signals via an
-    exception unless Tina itself broke.
+    exception unless Tina itself or a supplied callback raises.
+
+    Execution callbacks default at call time to `harness.run`, `verify.verify`,
+    and `harness.capture`. The runner and capture run inside the temporary
+    workspace; verification follows its cleanup, before recording and write-back.
+    No callback runs on a preview or an early return. Callback exceptions propagate.
 
     The executor is built only to ask `run_url()` — the worker's own log link,
     which the record carries for every outcome. Nothing is enqueued here, and
@@ -670,6 +680,9 @@ def run_item(
     started = time.monotonic()
     track = _with_model(config, config.track(track_name), model)
     _require_enabled(config, track)
+    runner = harness.run if runner is None else runner
+    verifier = verify.verify if verifier is None else verifier
+    capture = harness.capture if capture is None else capture
 
     if track.mode == "sweep":
         if item_id is not None:
@@ -677,7 +690,16 @@ def run_item(
                 f"{config.path}: track {track.name!r} is a sweep track and takes no --item",
                 fix="Drop --item; a sweep run has no work item.",
             )
-        return _run_sweep(config, track, executor, dry_run, started)
+        return _run_sweep(
+            config,
+            track,
+            executor,
+            dry_run,
+            started,
+            runner=runner,
+            verifier=verifier,
+            capture=capture,
+        )
     if item_id is None:
         raise ConfigError(
             f"{config.path}: track {track.name!r} runs from a queue and needs --item",
@@ -729,10 +751,10 @@ def run_item(
     with tempfile.TemporaryDirectory(prefix="tina-") as tmp:
         workdir = Path(tmp)
         text = prompt.build(config.track_dir(track), item, harness.outcome_path(workdir))
-        result = harness.run(harness_config, text, workdir, model=track.model, env=track.env)
-        harness.capture(result.session_dir, config.artifacts_path(), item.id)
+        result = runner(harness_config, text, workdir, model=track.model, env=track.env)
+        capture(result.session_dir, config.artifacts_path(), item.id)
 
-    report = verify.verify(result.report)
+    report = verifier(result.report)
     record = _record(track.name, item.id, report, result.exit_code, started, run_url)
     _write_back(track, source, item, record)
     return record
@@ -769,6 +791,10 @@ def _run_sweep(
     executor: Executor | None,
     dry_run: bool,
     started: float,
+    *,
+    runner: Runner,
+    verifier: Verifier,
+    capture: Capture,
 ) -> RunRecord | None:
     """Run the agent once with no work item. No source, no claim, no re-check.
 
@@ -792,10 +818,10 @@ def _run_sweep(
     with tempfile.TemporaryDirectory(prefix="tina-") as tmp:
         workdir = Path(tmp)
         text = prompt.build(config.track_dir(track), None, harness.outcome_path(workdir))
-        result = harness.run(harness_config, text, workdir, model=track.model, env=track.env)
-        harness.capture(result.session_dir, config.artifacts_path(), SWEEP_ITEM)
+        result = runner(harness_config, text, workdir, model=track.model, env=track.env)
+        capture(result.session_dir, config.artifacts_path(), SWEEP_ITEM)
 
-    report = verify.verify(result.report)
+    report = verifier(result.report)
     return _record(track.name, SWEEP_ITEM, report, result.exit_code, started, run_url)
 
 

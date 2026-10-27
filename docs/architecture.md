@@ -68,6 +68,52 @@ instructions in the prompt are the contract, because tracks are written
 against them. Text Tina writes where a person will read it — the write-back
 comment on a work item — names no runner for the same reason.
 
+#### Execution callbacks
+
+`cli.run_item` accepts three optional keyword-only callbacks. Existing positional
+arguments are unchanged. The public callable types live in `tina.execution`:
+
+```python
+runner(config: HarnessConfig, prompt: str, workdir: Path, *,
+       model: str | None, env: dict[str, str] | None) -> HarnessResult
+capture(session_dir: Path | None, artifacts_dir: Path | None, item: str) -> None
+verifier(report: OutcomeReport) -> OutcomeReport
+```
+
+Each omitted callback (or explicit `None`) resolves at invocation time to
+`tina.harness.run`, `tina.harness.capture`, or `tina.verify.verify`, respectively.
+Callbacks can be overridden independently. They are library dependency injection,
+not harness plugins: no registry, CLI flags, or configuration keys are involved.
+Harness commands remain declarative (§12).
+
+Queue and sweep runs use the same lifecycle:
+
+1. After admission and, for queued work, eligibility and claim checks, assemble
+   the prompt in a temporary workspace.
+2. Call the runner with the selected harness configuration, prompt, workspace,
+   effective model (including a one-run override), and track environment table.
+   The environment is the track's overrides, not a merged process environment.
+   Return `tina.harness.HarnessResult` with a structured report, exit code and
+   optional session directory; Tina does not parse harness stdout.
+3. Call capture with that session directory, the configured artifacts path and
+   item ID (`sweep` for a sweep run), **before workspace cleanup**. Capture is
+   called even when either path is `None`; custom capture decides what to retain.
+4. Delete the temporary workspace, then pass the report to the verifier. Its
+   returned report goes through the existing record and lifecycle write-back
+   logic. To record a verification mismatch without losing the agent's claim,
+   preserve the report's outcome/details/artifacts and set `verified=False`.
+
+Dry runs and early exits invoke none of these callbacks. Exceptions from custom
+callbacks propagate, skip remaining steps (including the record and write-back),
+and still clean up the temporary workspace. A claim already made is not rolled
+back. The default capture remains best-effort and logs its own failures (§12).
+
+These callbacks provide no isolation of users, secrets, network access or child
+processes. Custom execution owns process cleanup, including descendants, before
+returning or raising. Custom capture owns safe artifact selection and redaction;
+custom verification owns its access and trust policy. Tina continues to own
+orchestration, not those policies.
+
 Tina does not own scheduling. There is no open standard for declaring a schedule
 that targets native cloud schedulers, and cron dialects are not even portable
 across them (EventBridge uses 6 fields with `?` and a year; GCP, k8s, and
