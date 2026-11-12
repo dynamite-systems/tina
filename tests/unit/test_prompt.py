@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from tina import prompt
+from tina import harness, prompt
 from tina.models import WorkItem
 
 
@@ -24,6 +24,17 @@ def test_prompt_carries_skill_item_and_outcome_path(tmp_path: Path, work_item: W
     assert "Fix the vulnerability." in text
     assert str(outcome_path) in text
     assert text.index("Fix the vulnerability.") < text.index("## Work item")
+
+
+@pytest.mark.parametrize("sweep", [False, True])
+def test_prompt_tells_the_agent_to_write_through_the_outcome_path_var(
+    tmp_path: Path, work_item: WorkItem, sweep: bool
+) -> None:
+    outcome_path = tmp_path / "run" / "outcome.json"
+    text = prompt.build(track(tmp_path), None if sweep else work_item, outcome_path)
+
+    assert f'"${harness.OUTCOME_PATH_VAR}"' in text
+    assert str(outcome_path) in text
 
 
 def test_work_item_is_embedded_as_valid_json(tmp_path: Path, work_item: WorkItem) -> None:
