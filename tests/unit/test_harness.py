@@ -163,6 +163,86 @@ def test_no_track_env_inherits_the_environment_untouched(tmp_path: Path) -> None
     assert result.report.details == "True"
 
 
+@pytest.mark.parametrize("track_env", [None, {}, {"TRACK_VAR": "from-track"}])
+def test_the_harness_env_names_the_outcome_path_and_inherits_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, track_env: dict[str, str] | None
+) -> None:
+    monkeypatch.setenv("INHERITED_VAR", "from-parent")
+    fake = script(
+        tmp_path,
+        "import json, os, pathlib, sys\n"
+        "pathlib.Path(sys.argv[2], 'outcome.json').write_text(json.dumps({\n"
+        "    'outcome': 'resolved',\n"
+        "    'details': json.dumps({name: os.environ.get(name) for name in\n"
+        "        ('TINA_OUTCOME_PATH', 'INHERITED_VAR', 'TRACK_VAR')}),\n"
+        "}))\n",
+    )
+    workdir = tmp_path / "run"
+
+    result = harness.run(
+        config(sys.executable, str(fake), "{prompt_file}", "{outcome_dir}"),
+        "prompt",
+        workdir,
+        env=track_env,
+    )
+
+    assert json.loads(result.report.details) == {
+        "TINA_OUTCOME_PATH": str(workdir / "outcome.json"),
+        "INHERITED_VAR": "from-parent",
+        "TRACK_VAR": (track_env or {}).get("TRACK_VAR"),
+    }
+    assert harness.OUTCOME_PATH_VAR not in os.environ, "set for the subprocess only"
+
+
+WRITES_FROM_ELSEWHERE = (
+    'cd "$1" && printf \'%s\' \'{"outcome": "resolved", "details": "done"}\' > TARGET'
+)
+
+
+@pytest.mark.parametrize(
+    ("target", "outcome", "details"),
+    [
+        ('"$TINA_OUTCOME_PATH"', OutcomeStatus.RESOLVED, "done"),
+        ("outcome.json", OutcomeStatus.FAILED, "agent exited without writing outcome.json"),
+    ],
+)
+def test_an_agent_that_cds_away_still_reports_through_the_outcome_path_var(
+    tmp_path: Path, target: str, outcome: OutcomeStatus, details: str
+) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    command = WRITES_FROM_ELSEWHERE.replace("TARGET", target)
+
+    result = harness.run(
+        config("sh", "-c", command, "{prompt_file}", str(elsewhere)),
+        "prompt",
+        tmp_path / "run",
+    )
+
+    assert result.exit_code == 0
+    assert result.report.outcome is outcome
+    assert result.report.details == details
+
+
+@pytest.mark.parametrize(
+    ("target", "ok"), [('"$TINA_OUTCOME_PATH"', True), ("outcome.json", False)]
+)
+def test_a_probe_names_the_outcome_path_var_and_sets_it(
+    tmp_path: Path, target: str, ok: bool
+) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    command = 'grep -qF \'"$TINA_OUTCOME_PATH"\' "$0" && ' + WRITES_FROM_ELSEWHERE.replace(
+        "TARGET", target
+    )
+
+    result = harness.probe(
+        config("sh", "-c", command, "{prompt_file}", str(elsewhere)), model=None, timeout=10
+    )
+
+    assert result.ok is ok
+
+
 def test_a_session_dir_is_created_and_substituted(tmp_path: Path) -> None:
     """The harness writes whatever it writes there; tina only provides the path."""
     fake = script(

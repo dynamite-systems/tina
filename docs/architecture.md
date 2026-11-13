@@ -578,8 +578,11 @@ scrubber holds no secrets of its own.
 **Tina does not parse harness stdout.** Each harness reports differently, and
 parsing per-harness output is where swappability rots. Instead Tina passes an
 output path in the prompt and instructs the agent to write `outcome.json` there
-before finishing. Every harness can write a file, so the contract is
-harness-independent. Exit code is the fallback for "the agent died before
+before finishing. The same absolute path is exported to the harness process as
+`TINA_OUTCOME_PATH`, and the prompt tells the agent to write through it: an
+agent whose shell has `cd`-ed elsewhere, or that retypes the temp directory's
+random name, otherwise writes a report Tina never finds. Every harness can
+write a file, so the contract is harness-independent. Exit code is the fallback for "the agent died before
 writing."
 
 ---

@@ -31,6 +31,7 @@ OUTCOME_FILE = "outcome.json"
 PROMPT_FILE = "prompt.md"
 SESSION_DIR = "session"
 DEFAULT_TIMEOUT = 3600.0
+OUTCOME_PATH_VAR = "TINA_OUTCOME_PATH"
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,10 @@ class HarnessResult:
 def outcome_path(workdir: Path) -> Path:
     """Where the agent is told to write its report."""
     return workdir / OUTCOME_FILE
+
+
+def harness_env(workdir: Path, env: dict[str, str] | None = None) -> dict[str, str]:
+    return os.environ | (env or {}) | {OUTCOME_PATH_VAR: str(outcome_path(workdir))}
 
 
 def session_path(workdir: Path) -> Path:
@@ -90,7 +95,7 @@ def run(
 
     `env` is the track's table, merged over the inherited environment for the
     subprocess only — tina's own environment is never touched. Empty or None
-    inherits unchanged.
+    inherits unchanged. Either way the subprocess also gets `TINA_OUTCOME_PATH`.
 
     A command referencing {session_dir} gets a fresh directory per run; one
     that never references it gets no directory created at all.
@@ -113,7 +118,7 @@ def run(
         returncode = _run_with_retries(
             command,
             workdir,
-            os.environ | env if env else None,
+            harness_env(workdir, env),
             timeout if timeout is not None else default_timeout(),
             config.retry,
             sleep,
@@ -226,7 +231,8 @@ PROBE_TIMEOUT = 120.0
 PROBE_PROMPT = """\
 This is a connectivity probe, not a task. Do not read or change anything.
 
-Write a JSON file to exactly this path:
+Write a JSON file to "$TINA_OUTCOME_PATH" (an environment variable set for you),
+which is exactly this path:
 
     {outcome_path}
 
@@ -263,7 +269,9 @@ def probe(config: HarnessConfig, model: str | None, timeout: float = PROBE_TIMEO
             session_dir.mkdir(parents=True, exist_ok=True)
         command = config.command.render(prompt_file, workdir, model=model, session_dir=session_dir)
         try:
-            returncode, output = _run_relaying(command, workdir, None, timeout, echo=False)
+            returncode, output = _run_relaying(
+                command, workdir, harness_env(workdir), timeout, echo=False
+            )
         except subprocess.TimeoutExpired:
             return ProbeResult(ok=False, detail=f"timed out after {timeout:g}s")
         except OSError as exc:
