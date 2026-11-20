@@ -336,6 +336,138 @@ def test_claimed_under_claim_none_is_empty_without_a_search() -> None:
     assert source(handler, claim_policy="none").claimed("project = VUL") == []
 
 
+# --- handoff: a label consumed at claim (ADR-020) -----------------------------
+
+
+def handoff_source(handler, policy: str) -> JiraSource:
+    label = "bot-claimed" if policy == "label" else None
+    return source(handler, claim_policy=policy, claim_label=label, handoff_label="to-deps")
+
+
+@pytest.mark.parametrize(
+    ("policy", "before", "edits", "after"),
+    [
+        (
+            "label",
+            ["to-deps", "bot-claimed"],
+            [{"remove": "to-deps"}, {"add": "bot-claimed"}],
+            ["bot-claimed"],
+        ),
+        ("label", ["to-deps"], [{"remove": "to-deps"}, {"add": "bot-claimed"}], ["bot-claimed"]),
+        ("none", ["to-deps", "bug"], [{"remove": "to-deps"}], ["bug"]),
+    ],
+)
+def test_a_handoff_claim_consumes_the_label_in_one_write(
+    work_item: WorkItem,
+    policy: str,
+    before: list[str],
+    edits: list[dict[str, str]],
+    after: list[str],
+) -> None:
+    """A stale claim label does not refuse a handoff: the handoff is newer."""
+    state = {"labels": before}
+    calls: list[str] = []
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "PUT":
+            seen["body"] = json.loads(request.content)
+            state["labels"] = after
+            return httpx.Response(204)
+        return httpx.Response(200, json=issue(labels=state["labels"]))
+
+    assert handoff_source(handler, policy).claim(work_item) is True
+    assert calls == ["GET", "PUT", "GET"]
+    assert seen["body"] == {"update": {"labels": edits}}
+
+
+@pytest.mark.parametrize("policy", ["label", "none", "assign"])
+def test_a_handoff_claim_fails_when_the_label_is_still_there(
+    work_item: WorkItem, policy: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            return httpx.Response(204)
+        return httpx.Response(200, json=issue(labels=["to-deps"]))
+
+    assert handoff_source(handler, policy).claim(work_item) is False
+
+
+@pytest.mark.parametrize(
+    ("holder", "expected", "writes"),
+    [
+        (None, True, ["/rest/api/3/issue/VUL-1", "/rest/api/3/issue/VUL-1/assignee"]),
+        ("someone-else", False, ["/rest/api/3/issue/VUL-1"]),
+    ],
+)
+def test_a_handoff_under_assign_consumes_the_label_then_assigns(
+    work_item: WorkItem, holder: str | None, expected: bool, writes: list[str]
+) -> None:
+    """A ticket a person holds still refuses, but the label is gone, so it is
+    not offered again."""
+    state: dict[str, Any] = {
+        "labels": ["to-deps"],
+        "assignee": {"accountId": holder} if holder else None,
+    }
+    puts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            puts.append(request.url.path)
+            if request.url.path.endswith("/assignee"):
+                state["assignee"] = {"accountId": BOT}
+            else:
+                state["labels"] = []
+            return httpx.Response(204)
+        return httpx.Response(200, json=issue(assignee=state["assignee"], labels=state["labels"]))
+
+    assert handoff_source(handler, "assign").claim(work_item) is expected
+    assert puts == writes
+
+
+@pytest.mark.parametrize(
+    ("policy", "labels", "would_claim", "holder"),
+    [
+        ("label", ["to-deps", "bot-claimed"], True, ""),
+        ("label", ["bot-claimed"], False, "label:bot-claimed"),
+        ("none", [], True, ""),
+    ],
+)
+def test_claim_prognosis_with_a_handoff_label(
+    work_item: WorkItem, policy: str, labels: list[str], would_claim: bool, holder: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET", "claim_prognosis must never write"
+        return httpx.Response(200, json=issue(labels=labels))
+
+    prognosis = handoff_source(handler, policy).claim_prognosis(work_item)
+
+    assert (prognosis.would_claim, prognosis.holder) == (would_claim, holder)
+
+
+def test_claimed_leaves_out_tickets_still_carrying_the_handoff_label() -> None:
+    """A ticket with the handoff label is queued, not held."""
+    sent: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content)["jql"])
+        return httpx.Response(200, json={"issues": []})
+
+    jql = (
+        '(project = SEC AND (labels IS EMPTY OR labels != "bot-claimed"))'
+        ' OR (project = SEC AND labels = "to-deps" AND statusCategory != Done)'
+        " ORDER BY created ASC"
+    )
+    handoff_source(handler, "label").claimed(jql)
+
+    assert sent == [
+        '((project = SEC AND labels = "bot-claimed")'
+        ' OR (project = SEC AND labels = "to-deps" AND statusCategory != Done))'
+        ' AND (labels IS EMPTY OR labels != "to-deps") ORDER BY created ASC'
+    ]
+
+
 # --- matches: the configured query, scoped to one item -----------------------
 
 

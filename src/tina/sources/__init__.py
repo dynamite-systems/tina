@@ -24,6 +24,7 @@ def build(track: TrackConfig, client: httpx.Client | None = None) -> Source:
             claim_label=track.claim_label,
             claim_transition=track.claim_transition,
             blocked_transition=track.blocked_transition,
+            handoff_label=track.handoff_label,
         )
     if track.source == "github":
         return GitHubSource(

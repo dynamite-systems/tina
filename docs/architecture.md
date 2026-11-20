@@ -188,6 +188,16 @@ none of the builder's invariants. A query that selects existing items rather
 than a work queue (several projects, closed or assigned items, a different
 sort) keeps its own JQL and still onboards teams with one array edit.
 
+A Jira track may also set `handoff_label`
+([ADR-020](adr/020-handoff-label.md)). Tina then ORs a second branch onto the
+query, built or full: `(<query>) OR (labels = "<handoff_label>" AND
+statusCategory != Done)`, with `project = <project>` added when the track
+names one. The branch ignores status, `filters`, assignee, and the claim and
+blocked markers, so a person or another track can hand one ticket to the track
+by labeling it: a retry of a Blocked ticket, a team outside `filters` trying
+the track, or a router picking a track. Each handoff label belongs to one
+track.
+
 ### Sweep tracks
 
 Not every useful track has a queue: scan recent job executions and file an
@@ -438,6 +448,15 @@ must exclude the label, and `claimed()`/`status` invert that negated label
 token rather than the assignee clause. `claim = "none"` skips claiming
 entirely — dedupe is the query's job. On Jira, `claim_transition` names a
 status transition applied after a successful claim.
+
+A ticket carrying the track's `handoff_label` is claimed by consuming it: one
+write removes the label and, under `claim = "label"`, adds `claim_label`, and a
+re-read confirms both. A claim label already present does not refuse a
+handoff. Under `claim = "assign"` the label is consumed and then the usual
+assignee compare-and-set runs, so a ticket another user holds still refuses.
+Under `claim = "none"` consuming the label is the whole claim. `claimed()`
+leaves out tickets that still carry the handoff label, since those are queued,
+not held.
 
 This is a choice between failure modes:
 

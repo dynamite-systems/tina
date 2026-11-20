@@ -96,3 +96,26 @@ def test_jira_scope_narrows_a_full_query_without_the_invariants(full: str, expec
 
     assert jql == expected
     assert "assignee" not in jql
+
+
+@pytest.mark.parametrize(
+    ("own", "project", "expected"),
+    [
+        (
+            'project = SEC AND status = "Open" AND assignee IS EMPTY ORDER BY created ASC',
+            "SEC",
+            '(project = SEC AND status = "Open" AND assignee IS EMPTY)'
+            ' OR (project = SEC AND labels = "to-deps" AND statusCategory != Done)'
+            " ORDER BY created ASC",
+        ),
+        (
+            "project = A OR project = B",
+            None,
+            '(project = A OR project = B) OR (labels = "to-deps" AND statusCategory != Done)',
+        ),
+    ],
+)
+def test_jira_handoff_ors_a_label_branch_onto_the_query(
+    own: str, project: str | None, expected: str
+) -> None:
+    assert query.jira_handoff(own, "to-deps", project) == expected

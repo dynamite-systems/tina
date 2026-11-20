@@ -1,6 +1,6 @@
 # 20. A handoff label is a second way into a Jira track
 
-**Status:** Proposed
+**Status:** Accepted
 
 **Date:** 2026-11-20
 
@@ -79,6 +79,9 @@ the handoff label is already gone when the worker reads the ticket, another
 worker consumed it, and this one exits `no_action_needed`. A claim label
 already on the ticket does not block a handoff claim, because the handoff is
 newer than the old claim.
+Under `claim = "assign"`, the label is consumed and then the usual assignee
+compare-and-set runs, so a ticket another user holds still refuses; with the
+label gone, it is not offered again.
 
 **Validation.** `handoff_label` must be one label with no whitespace, set only
 on a Jira queue track, unique across tracks, and different from that track's

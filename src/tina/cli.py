@@ -733,7 +733,7 @@ def run_item(
             run_url=run_url,
         )
 
-    if track.claim != "none" and not source.claim(item):
+    if (track.claim != "none" or track.handoff_label) and not source.claim(item):
         logger.info("already claimed", extra={"track": track.name, "item": item.id})
         return _record(
             track.name,
@@ -857,7 +857,7 @@ def _preview_run(
         logger.info("would run", extra=fields)
         return
 
-    if track.claim == "none":
+    if track.claim == "none" and not track.handoff_label:
         # No claim and no prognosis to preview — the query is the dedupe.
         output.would('Would skip the claim — claim = "none"; dedupe is the query\'s job')
         fields |= _preview_prompt(config, track, item)
