@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.7](https://github.com/dynamite-systems/tina/compare/v0.1.6...v0.1.7) (2026-11-20)
+
+
+### Features
+
+* allow callers to customize execution boundaries ([#113](https://github.com/dynamite-systems/tina/issues/113)) ([92c5eb3](https://github.com/dynamite-systems/tina/commit/92c5eb340ae4cc93888507159813e12d18e4e1cc))
+* **config:** handoff_label hands one ticket to a Jira track (ADR-020) ([#119](https://github.com/dynamite-systems/tina/issues/119)) ([15f2c43](https://github.com/dynamite-systems/tina/commit/15f2c43766fe42b94e3d6c2b747891b27d86e1d0))
+
+
+### Bug Fixes
+
+* **tests:** clean all adapter environment inputs ([#109](https://github.com/dynamite-systems/tina/issues/109)) ([1fb8d62](https://github.com/dynamite-systems/tina/commit/1fb8d62722bf294f172732e1dc21634aa9e47615))
+
+
+### Documentation
+
+* **adr:** 020 — a handoff label is a second way into a Jira track ([#118](https://github.com/dynamite-systems/tina/issues/118)) ([dfbf577](https://github.com/dynamite-systems/tina/commit/dfbf577a802a905bde4e5025111be6805ec43101))
+
 ## [0.1.6](https://github.com/raiderrobert/tina/compare/v0.1.5...v0.1.6) (2026-10-07)
 
 
