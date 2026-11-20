@@ -86,6 +86,11 @@ DESCRIPTIONS: dict[str, str] = {
         "Jira only: a transition applied after a successful claim, so the queued status stays "
         "truthful. Built queries then offer back bot-held items still in the queued status."
     ),
+    "handoff_label": (
+        "Jira only: a label that hands one ticket to this track whatever its query says. "
+        "Tina ORs `labels = <label> AND statusCategory != Done` (in `project`, when set) onto "
+        "the query, and the claim removes the label. Unset means the track takes no handoffs."
+    ),
     "env": (
         "Literal strings merged over the inherited environment for the harness subprocess "
         "only. Uppercase names; `TINA_*` is reserved."

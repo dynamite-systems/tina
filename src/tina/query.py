@@ -79,6 +79,23 @@ def jira_scope(query: str, filters: dict[str, list[str]]) -> str:
     return " AND ".join([f"({predicate.strip()})", *_filter_clauses(filters)]) + order
 
 
+def jira_handoff(query: str, label: str, project: str | None) -> str:
+    """A Jira track's query with its handoff branch ORed on (ADR-020).
+
+    The branch selects any not-done issue carrying the handoff label, in the
+    track's project when it names one, whatever the rest of the query says:
+    status, filters, assignee, and the claim and blocked markers are all left
+    out. The track's own query is parenthesized so its top-level `AND`s stay
+    its own, and its trailing ORDER BY, if any, is kept at the end.
+    """
+    match = ORDER_BY.search(query)
+    predicate = query[: match.start()] if match else query
+    order = match.group(0) if match else ""
+    branch = [f"project = {project}"] if project else []
+    branch += [f'labels = "{label}"', "statusCategory != Done"]
+    return f"({predicate.strip()}) OR ({' AND '.join(branch)})" + order
+
+
 def _filter_clauses(filters: dict[str, list[str]]) -> list[str]:
     clauses = []
     for field, values in filters.items():

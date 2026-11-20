@@ -84,6 +84,7 @@ _QUEUE_ONLY_KEYS = frozenset(
         "claim",
         "claim_label",
         "claim_transition",
+        "handoff_label",
         "on_failure",
         "blocked_label",
         "blocked_transition",
@@ -112,6 +113,7 @@ _JIRA_FIELD = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _\-\[\]\.]*$")
 _JIRA_VALUE = re.compile(r"^[A-Za-z0-9 _\-'&.:/]+$")
 _GITHUB_REPO = re.compile(r"^[\w.-]+/[\w.-]+$")
 _GITHUB_LABEL = re.compile(r'^[^"\s][^"]*$')
+_JIRA_LABEL = re.compile(r'^[^"\s]+$')
 
 
 class ConfigError(TinaError, ValueError):
@@ -298,6 +300,10 @@ class TrackConfig(BaseModel):
     # A Jira transition applied after a successful claim, so the queued status
     # stays truthful and humans can requeue by transition.
     claim_transition: str | None = None
+    # Jira only: a label that hands one ticket to this track whatever its
+    # query says (ADR-020). Tina ORs a branch selecting it onto the query, and
+    # the claim consumes it. Unset means the track takes no handoffs.
+    handoff_label: str | None = None
     # Literal strings merged over the inherited environment for the harness
     # subprocess only — how a track skill's scripts get configured.
     env: dict[str, str] = Field(default_factory=dict)
@@ -369,6 +375,13 @@ class TrackConfig(BaseModel):
             raise ValueError('claim = "label" requires claim_label')
         if self.claim != "label" and self.claim_label is not None:
             raise ValueError('claim_label only applies with claim = "label"')
+        if self.handoff_label is not None:
+            if self.source != "jira":
+                raise ValueError("handoff_label only applies to jira tracks")
+            taken = {"claim_label": self.claim_label, "blocked_label": self.blocked_label}
+            clash = sorted(key for key, label in taken.items() if label == self.handoff_label)
+            if clash:
+                raise ValueError(f"handoff_label must differ from {', '.join(clash)}")
         if self.claim_transition is not None:
             if self.source != "jira":
                 raise ValueError("claim_transition only applies to jira tracks")
@@ -377,6 +390,15 @@ class TrackConfig(BaseModel):
                     'claim_transition cannot apply under claim = "none" — nothing is ever claimed'
                 )
         return self
+
+    @field_validator("handoff_label")
+    @classmethod
+    def _check_handoff_label(cls, value: str | None) -> str | None:
+        if value is not None and not _JIRA_LABEL.fullmatch(value):
+            raise ValueError(
+                f"handoff_label {value!r} must be one Jira label: no whitespace or quotes"
+            )
+        return value
 
     @field_validator("env")
     @classmethod
@@ -587,23 +609,32 @@ def parse(
     )
     _validate_names(config)
     _validate_model(config)
+    _validate_handoffs(config)
     return config
 
 
 def _with_query(track: TrackConfig) -> TrackConfig:
     """Fill in the query a track gave the parts of, or narrow a full Jira
-    query by its filters. A sweep or an unfiltered override passes through
-    untouched."""
+    query by its filters, then OR on the handoff branch when the track sets a
+    handoff label. A sweep or an unfiltered override with no handoff passes
+    through untouched."""
     if track.mode == "sweep":
         return track
+    built = _built_query(track)
+    if track.handoff_label:
+        built = query_builders.jira_handoff(built, track.handoff_label, track.project)
+    if built == track.query:
+        return track
+    return track.model_copy(update={"query": built})
+
+
+def _built_query(track: TrackConfig) -> str:
     if track.query:
         if not track.filters:
-            return track
-        return track.model_copy(
-            update={"query": query_builders.jira_scope(track.query, track.filters)}
-        )
+            return track.query
+        return query_builders.jira_scope(track.query, track.filters)
     if track.source == "jira":
-        built = query_builders.jira_query(
+        return query_builders.jira_query(
             str(track.project),
             track.status,
             track.filters,
@@ -613,14 +644,12 @@ def _with_query(track: TrackConfig) -> TrackConfig:
             claim_transition=track.claim_transition,
             blocked_label=None if track.blocked_transition else track.blocked_label,
         )
-    else:
-        built = query_builders.github_query(
-            str(track.repo),
-            track.labels,
-            claim_label=track.claim_label if track.claim == "label" else None,
-            blocked_label=track.blocked_label,
-        )
-    return track.model_copy(update={"query": built})
+    return query_builders.github_query(
+        str(track.repo),
+        track.labels,
+        claim_label=track.claim_label if track.claim == "label" else None,
+        blocked_label=track.blocked_label,
+    )
 
 
 def _tables(value: Any, path: Path, key: str) -> list[tuple[str, dict[str, Any]]]:
@@ -662,6 +691,23 @@ def _validate_names(config: Config) -> None:
             raise ConfigError(
                 f"{config.path}: [{track.name}]: source 'github' requires repo = \"owner/name\""
             )
+
+
+def _validate_handoffs(config: Config) -> None:
+    """One handoff label, one track: a label two tracks select would hand the
+    same ticket to both."""
+    owners: dict[str, str] = {}
+    for track in config.tracks.values():
+        label = track.handoff_label
+        if label is None:
+            continue
+        if label in owners:
+            raise ConfigError(
+                f"{config.path}: [{track.name}]: handoff_label {label!r} is already"
+                f" [{owners[label]}]'s",
+                fix="Give each track its own handoff label.",
+            )
+        owners[label] = track.name
 
 
 def _validate_model(config: Config) -> None:

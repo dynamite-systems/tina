@@ -70,6 +70,9 @@ result = "github:pr"        # declaration only — the agent produces it
 #                             # GitHub: -label:bot-claimed
 # claim_transition = "In Progress"  # jira only: transition applied after a
 #                             # successful claim, so the queued status stays true
+# handoff_label = "to-vul"    # jira only (ADR-020): a ticket with this label
+#                             # reaches the track whatever the query says; the
+#                             # claim removes it. Unset means no handoffs.
 # enabled = true              # false ships the track without running it
 # on_failure = "leave"        # "annotate": after a failed, needs_human, or
 #                             # unverified run, comment the outcome on the

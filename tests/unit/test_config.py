@@ -636,6 +636,79 @@ def test_interpolated_jira_values_are_validated(tmp_path: Path, snippet: str, me
         config.load(write(tmp_path, text))
 
 
+HANDOFF = """
+harness = "pi"
+
+[harnesses.pi]
+command = ["pi", "--prompt-file", "{prompt_file}"]
+
+[deps]
+source = "jira"
+project = "SEC"
+claim = "label"
+claim_label = "bot-claimed"
+handoff_label = "to-deps"
+
+[deps.filters]
+Team = ["Payments"]
+"""
+
+
+def test_a_handoff_label_ors_its_branch_onto_the_built_query(tmp_path: Path) -> None:
+    cfg = config.load(write(tmp_path, HANDOFF))
+
+    assert cfg.track("deps").query == (
+        '(project = SEC AND status = "Open" AND "Team" in ("Payments") AND assignee IS EMPTY'
+        ' AND (labels IS EMPTY OR labels not in ("tina-blocked", "bot-claimed")))'
+        ' OR (project = SEC AND labels = "to-deps" AND statusCategory != Done)'
+        " ORDER BY created ASC"
+    )
+    assert cfg.track("deps").handoff_label == "to-deps"
+
+
+def test_a_handoff_label_ors_its_branch_onto_a_full_query(tmp_path: Path) -> None:
+    text = MINIMAL + 'handoff_label = "to-vul"\n'
+
+    cfg = config.load(write(tmp_path, text))
+
+    assert cfg.track("vul").query == (
+        '(project = VUL) OR (labels = "to-vul" AND statusCategory != Done)'
+    )
+
+
+@pytest.mark.parametrize(
+    ("snippet", "message"),
+    [
+        ('handoff_label = "two words"', "one Jira label"),
+        ("handoff_label = 'a\"b'", "one Jira label"),
+        ('handoff_label = "bot-claimed"', "must differ from claim_label"),
+        ('handoff_label = "tina-blocked"', "must differ from blocked_label"),
+    ],
+)
+def test_a_bad_handoff_label_fails_fast(tmp_path: Path, snippet: str, message: str) -> None:
+    text = HANDOFF.replace('handoff_label = "to-deps"', snippet)
+
+    with pytest.raises(config.ConfigError, match=message):
+        config.load(write(tmp_path, text))
+
+
+def test_a_handoff_label_on_a_github_track_fails_fast(tmp_path: Path) -> None:
+    text = MINIMAL.replace(
+        'source = "jira"\nquery = "project = VUL"',
+        'source = "github"\nrepo = "acme/api"\nhandoff_label = "to-vul"',
+    )
+
+    with pytest.raises(config.ConfigError, match="handoff_label only applies to jira tracks"):
+        config.load(write(tmp_path, text))
+
+
+def test_two_tracks_may_not_share_a_handoff_label(tmp_path: Path) -> None:
+    text = HANDOFF + '\n[other]\nsource = "jira"\nproject = "OPS"\nhandoff_label = "to-deps"\n'
+
+    with pytest.raises(config.ConfigError, match="already \\[deps\\]'s"):
+        config.load(write(tmp_path, text))
+
+
 def test_github_labels_reject_quotes(tmp_path: Path) -> None:
     text = MINIMAL.replace(
         'source = "jira"\nquery = "project = VUL"',

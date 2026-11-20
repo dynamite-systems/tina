@@ -141,6 +141,7 @@ class JiraSource:
         claim_label: str | None = None,
         claim_transition: str | None = None,
         blocked_transition: str | None = None,
+        handoff_label: str | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.base_url = (base_url or require_env("JIRA_BASE_URL", "jira")).rstrip("/")
@@ -151,6 +152,7 @@ class JiraSource:
         self.claim_label = claim_label
         self.claim_transition = claim_transition
         self.blocked_transition = blocked_transition
+        self.handoff_label = handoff_label
         if client is None:
             email = require_env("JIRA_EMAIL", "jira")
             token = require_env("JIRA_API_TOKEN", "jira")
@@ -196,10 +198,20 @@ class JiraSource:
         assign to the bot, re-read to confirm the write landed. An issue the
         bot already holds re-claims successfully. A label claim is the same
         shape with the claim label in place of the assignee — except that a
-        label carries no identity, so present always refuses. Either way, a
-        confirmed claim then applies `claim_transition` when the track set one.
+        label carries no identity, so present always refuses. Under `none`
+        there is nothing to take. An issue carrying the track's handoff label
+        is claimed by consuming it (ADR-020). Either way, a confirmed claim
+        then applies `claim_transition` when the track set one.
         """
-        taken = self._claim_by_label(item) if self.claim_policy == "label" else self._assign(item)
+        match self.claim_policy:
+            case _ if self._handed_off(item):
+                taken = self._claim_by_handoff(item)
+            case "label":
+                taken = self._claim_by_label(item)
+            case "assign":
+                taken = self._assign(item)
+            case _:
+                taken = True
         if taken and self.claim_transition:
             self._apply_transition(item)
         return taken
@@ -230,6 +242,37 @@ class JiraSource:
 
         return self.claim_label in self._issue(item.id).fields.labels
 
+    def _handed_off(self, item: WorkItem) -> bool:
+        if not self.handoff_label:
+            return False
+        return self.handoff_label in self._issue(item.id).fields.labels
+
+    def _claim_by_handoff(self, item: WorkItem) -> bool:
+        """Consume the handoff label and take the track's claim in its place.
+
+        One `PUT` removes the handoff label and, under a label claim, adds the
+        claim label, so the issue is never left with neither. A claim label
+        already present does not refuse: the handoff is the newer instruction.
+        Under assign the label is consumed first and the assignee
+        compare-and-set runs as usual, so a ticket another user holds still
+        refuses, and is not offered again.
+        """
+        edits: list[dict[str, str]] = [{"remove": str(self.handoff_label)}]
+        if self.claim_policy == "label":
+            edits.append({"add": str(self.claim_label)})
+        self._request("PUT", f"{ISSUE_PATH}/{item.id}", json={"update": {"labels": edits}})
+
+        labels = self._issue(item.id).fields.labels
+        if self.handoff_label in labels:
+            return False
+        match self.claim_policy:
+            case "label":
+                return self.claim_label in labels
+            case "assign":
+                return self._assign(item)
+            case _:
+                return True
+
     def _apply_transition(self, item: WorkItem) -> None:
         """Move the claimed issue out of the queued status. Best-effort, like
         the other lifecycle writes: the claim already stands, and a stale
@@ -258,13 +301,19 @@ class JiraSource:
 
         Consistent with each strategy: under assign the bot already holding
         the issue is a claim that would proceed; under label a present claim
-        label refuses, whoever put it there.
+        label refuses, whoever put it there, unless the issue carries the
+        handoff label, which overrides it; under none nothing is held.
         """
-        if self.claim_policy == "label":
-            if self.claim_label in self._issue(item.id).fields.labels:
+        fields = self._issue(item.id).fields
+        handed_off = bool(self.handoff_label) and self.handoff_label in fields.labels
+        match self.claim_policy:
+            case "none":
+                return ClaimPrognosis(would_claim=True, holder="")
+            case "label" if self.claim_label in fields.labels and not handed_off:
                 return ClaimPrognosis(would_claim=False, holder=f"label:{self.claim_label}")
-            return ClaimPrognosis(would_claim=True, holder="")
-        assignee = self._issue(item.id).fields.assignee
+            case "label":
+                return ClaimPrognosis(would_claim=True, holder="")
+        assignee = fields.assignee
         if assignee is None:
             return ClaimPrognosis(would_claim=True, holder="")
         if assignee.account_id == self.bot_account_id:
@@ -286,8 +335,10 @@ class JiraSource:
         if self.claim_policy == "none":
             return []
         if self.claim_policy == "label":
-            return self.query(claimed_label_jql(q, str(self.claim_label)))
-        return self.query(claimed_jql(q, self.bot_account_id))
+            inverted = claimed_label_jql(q, str(self.claim_label))
+        else:
+            inverted = claimed_jql(q, self.bot_account_id)
+        return self.query(without_handoffs(inverted, self.handoff_label))
 
     def annotate(self, item: WorkItem, comment: str) -> None:
         """Comment on the issue. Best-effort per the contract: log, never raise."""
@@ -407,6 +458,21 @@ def claimed_label_jql(q: str, label: str) -> str:
             " so dispatch skips claimed issues.",
         )
     return rewritten
+
+
+def without_handoffs(q: str, label: str | None) -> str:
+    """`q` minus issues still carrying the handoff label.
+
+    The claim consumes the label, so an issue that still has it is queued,
+    not held: the handoff branch of an inverted query would otherwise count
+    it as in flight. The ORDER BY, if any, stays at the end.
+    """
+    if not label:
+        return q
+    match = ORDER_BY.search(q)
+    predicate = q[: match.start()] if match else q
+    order = match.group(0) if match else ""
+    return f'({predicate.strip()}) AND (labels IS EMPTY OR labels != "{label}")' + order
 
 
 def adf_document(text: str) -> dict[str, Any]:

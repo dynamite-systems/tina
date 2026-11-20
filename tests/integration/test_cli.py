@@ -1277,6 +1277,23 @@ def test_a_dry_run_under_claim_none_says_dedupe_is_the_querys_job(
     assert "command" in line, "the rest of the preview still happens"
 
 
+@pytest.mark.parametrize("claimable", [True, False])
+def test_a_handoff_label_claims_under_claim_none(
+    unclaiming: Path, monkeypatch: pytest.MonkeyPatch, claimable: bool
+) -> None:
+    """The handoff label is consumed at claim, so claim = "none" still claims."""
+    unclaiming.write_text(unclaiming.read_text() + 'handoff_label = "to-vul"\n')
+    source = wire(monkeypatch, FakeSource(items("VUL-1"), claimable=claimable))
+    monkeypatch.setattr(executors, "build", lambda config: FakeExecutor())
+
+    result = runner.invoke(cli.app, [*RUN_ARGV, "--config", str(unclaiming)])
+    record = last_record(result.stdout)
+
+    assert result.exit_code == 0
+    assert source.claims == ["VUL-1"]
+    assert (record["report"]["details"] == "another worker holds this item") is not claimable
+
+
 # --- the eligibility re-check: stale items exit before any write -------------
 
 
