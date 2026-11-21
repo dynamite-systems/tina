@@ -44,9 +44,14 @@ OUTCOME_INSTRUCTIONS = """\
 
 You run once. There is no follow-up turn, and nothing reads your stdout.
 
-Before you finish, write a JSON file to exactly this path:
+Before you finish, write a JSON file to "$TINA_OUTCOME_PATH". That environment
+variable is set for you and holds exactly this path:
 
     {outcome_path}
+
+Write through the variable, for example `cat > "$TINA_OUTCOME_PATH"`, not a
+relative `outcome.json` and not a retyped path: the variable stays correct
+after any `cd`.
 
 The file must contain a single JSON object:
 
