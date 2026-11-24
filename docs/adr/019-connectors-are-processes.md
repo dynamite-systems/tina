@@ -52,8 +52,9 @@ it over standard streams in a small JSON-RPC protocol —
 `initialize` handshake that carries a protocol version and the track's
 connector-specific options, and two optional capabilities, `build_query`
 (structured inputs → a query, what `tina.query` does today) and
-`artifact_endpoint` (a web URL → the API resource that proves it exists, what
-`verify.api_url` does today).
+`verify_artifact` (does the artifact behind this web URL exist — the check
+`verify.api_url` enables today, done by the connector with its own
+credentials, so no token ever crosses the pipe).
 
 Configuration names the connector the way it names the harness, and moves
 every connector-specific key out of Tina's schema into a table the connector
@@ -80,10 +81,11 @@ keeps two in-tree connectors: GitHub, and a `file` connector that reads work
 items from a JSONL file and claims with a sidecar marker — the connector the
 demo and the tests use, and the one a new author copies.
 
-Conformance is a command, not a test module: `tina connector-check <command>`
-drives any executable through the protocol — framing, handshake, every
-method's shape, the error shape, shutdown — so a connector author's CI proves
-compatibility in their language without importing anything of Tina's.
+Conformance is planned as a command, not a test module (`tina connector-check
+<command>`, not yet implemented): it will drive any executable through the
+protocol — framing, handshake, every method's shape, the error shape, shutdown
+— so a connector author's CI proves compatibility in their language without
+importing anything of Tina's.
 
 Executors are the same shape and get the same treatment later; this decision
 scopes to sources, where the need is.
@@ -131,13 +133,14 @@ reopen.
 - Tina's config schema shrinks to Tina's own keys. `repo`, `labels`,
   `project`, `status`, `filters`, `extra`, `claim_transition`, and
   `blocked_transition` become each connector's business, validated by the
-  connector at `initialize` — so `tina validate` and `tina doctor` still fail
-  at load time, by asking the process instead of a pydantic model. This is a
+  connector at `initialize` — currently checked by `tina doctor` and runtime
+  commands at connector initialization (`tina validate` remains static-only and
+  does not initialize connector options yet; integration is deferred). This is a
   breaking config change; the migration is mechanical (move keys under
   `[<track>.options]`) and ships with an upgrade note.
 - `tina.query` and the tracker-specific half of `tina.verify` move into the
   connectors that own that knowledge, behind `build_query` and
-  `artifact_endpoint`.
+  `verify_artifact`.
 - Tina owns subprocess lifecycle for one more family: spawn on first use, one
   connector process per Tina invocation, a per-request timeout, `shutdown`
   then a grace period then `kill`. A connector that dies is a `SourceError`

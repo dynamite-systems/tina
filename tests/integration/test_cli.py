@@ -19,8 +19,9 @@ from typer.testing import CliRunner
 
 import tina
 from tina import cli, config, control, executors, harness, log, sources, verify
+from tina.config import Config, TrackConfig
 from tina.models import OutcomeReport, OutcomeStatus, WorkItem
-from tina.sources.base import ClaimPrognosis
+from tina.sources.base import ClaimPrognosis, Source
 
 # The one URL the stubbed verifier considers real.
 GOOD_ARTIFACT = "https://example.test/pr/1"
@@ -160,8 +161,10 @@ def offline_verify(monkeypatch: pytest.MonkeyPatch) -> None:
 
     real = verify.verify
 
-    def offline(report: OutcomeReport, client: httpx.Client | None = None) -> OutcomeReport:
-        return real(report, httpx.Client(transport=httpx.MockTransport(handler)))
+    def offline(
+        report: OutcomeReport, client: httpx.Client | None = None, check=None
+    ) -> OutcomeReport:
+        return real(report, httpx.Client(transport=httpx.MockTransport(handler)), check=check)
 
     monkeypatch.setattr(verify, "verify", offline)
 
@@ -189,14 +192,14 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> tuple[FakeSource, FakeExecutor]:
     """Point the adapter factories at fakes, so the real argv path can be driven."""
     source = FakeSource(items("VUL-1", "VUL-2", "VUL-3"))
     executor = FakeExecutor()
-    monkeypatch.setattr(sources, "build", lambda track, client=None: source)
+    monkeypatch.setattr(sources, "build", lambda track, client=None, **kw: source)
     monkeypatch.setattr(executors, "build", lambda config: executor)
     return source, executor
 
 
 def wire(monkeypatch: pytest.MonkeyPatch, source: FakeSource) -> FakeSource:
     """Point `sources.build` at one specific fake, and hand it back."""
-    monkeypatch.setattr(sources, "build", lambda track, client=None: source)
+    monkeypatch.setattr(sources, "build", lambda track, client=None, **kw: source)
     return source
 
 
@@ -385,7 +388,7 @@ def disabled(project: Path) -> Path:
 def test_dispatch_refuses_a_disabled_track(disabled: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A silent no-op would look identical to an empty backlog."""
     source, executor = NoQuerySource(items("VUL-1")), FakeExecutor()
-    monkeypatch.setattr(sources, "build", lambda track, client=None: source)
+    monkeypatch.setattr(sources, "build", lambda track, client=None, **kw: source)
     monkeypatch.setattr(executors, "build", lambda config: executor)
 
     result = runner.invoke(cli.app, ["dispatch", "--track", "vul", "--config", str(disabled)])
@@ -641,7 +644,7 @@ def test_a_dry_run_with_no_matches_exits_zero(
 ) -> None:
     """Zero matches is a valid preview, not an error."""
     source, executor = FakeSource([]), FakeExecutor()
-    monkeypatch.setattr(sources, "build", lambda track, client=None: source)
+    monkeypatch.setattr(sources, "build", lambda track, client=None, **kw: source)
     monkeypatch.setattr(executors, "build", lambda config: executor)
 
     result = runner.invoke(
@@ -1784,7 +1787,7 @@ def test_a_paused_dispatch_exits_zero_and_enqueues_nothing(
     """Paused is working as intended, not an error."""
     monkeypatch.setenv("TINA_CONTROL_INLINE", "paused = true")
     source, executor = NoQuerySource(items("VUL-1")), FakeExecutor()
-    monkeypatch.setattr(sources, "build", lambda track, client=None: source)
+    monkeypatch.setattr(sources, "build", lambda track, client=None, **kw: source)
     monkeypatch.setattr(executors, "build", lambda config: executor)
 
     result = runner.invoke(cli.app, ["dispatch", "--track", "vul", "--config", str(project)])
@@ -2691,3 +2694,83 @@ def test_a_model_override_must_be_in_the_models_list(
 
     record = cli.run_item(config.load(modelled), "vul", "VUL-1", model="own-model")
     assert record is not None
+
+
+def test_run_records_outcome_and_attempts_block_when_connector_faults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A connector faulting during verify_artifact and annotate still records the run and blocks."""
+    root = Path(__file__).resolve().parents[2]
+    events_file = tmp_path / "events.log"
+    script = tmp_path / "agent.py"
+    script.write_text(
+        "import json, pathlib, sys\n"
+        'payload = {"outcome": "resolved", "details": "opened PR", '
+        '"artifacts": [{"kind": "github:pr", "url": "https://fake.test/F-1"}]}\n'
+        'pathlib.Path(sys.argv[2], "outcome.json").write_text(json.dumps(payload))\n'
+    )
+    track = tmp_path / "tracks" / "fake"
+    track.mkdir(parents=True)
+    (track / "SKILL.md").write_text("# Fake track\n")
+
+    cfg = tmp_path / "tina.toml"
+    cfg.write_text(
+        f'harness = "fake"\n'
+        f'tracks_dir = "tracks"\n\n'
+        f"[harnesses.fake]\n"
+        f'command = ["{sys.executable}", "{script}", "{{prompt_file}}", "{{outcome_dir}}"]\n\n'
+        f"[sources.fake]\n"
+        f'command = ["{sys.executable}", "-m", "tests.fakes.connector"]\n\n'
+        f"[bug]\n"
+        f'source = "fake"\n'
+        f'track = "fake"\n'
+        f'on_failure = "annotate"\n\n'
+        f"[bug.options]\n"
+        f"items = 1\n"
+        f"fail_verify = true\n"
+        f"fail_annotate = true\n"
+        f"events_file = {json.dumps(str(events_file))}\n"
+    )
+
+    built: list[Any] = []
+    real_build = sources.build
+
+    def tracking_build(
+        track_cfg: TrackConfig,
+        client: httpx.Client | None = None,
+        config: Config | None = None,
+    ) -> Source:
+        src = real_build(track_cfg, client=client, config=config)
+        built.append(src)
+        return src
+
+    monkeypatch.setattr(sources, "build", tracking_build)
+    try:
+        result = runner.invoke(
+            cli.app,
+            ["run", "--track", "bug", "--item", "F-1", "--config", str(cfg)],
+            env={"PYTHONPATH": str(root)},
+        )
+    finally:
+        for src in built:
+            close = getattr(src, "close", None)
+            if callable(close):
+                close()
+
+    assert result.exit_code == 0, plain(result.stderr)
+    lines = json_lines(result.stdout)
+    messages = [line["message"] for line in lines]
+    assert "artifact unreachable" in messages
+    assert "run complete" in messages
+    assert "annotate failed" in messages
+    assert messages.index("run complete") < messages.index("annotate failed")
+
+    record = next(line for line in lines if line["message"] == "run complete")
+    assert record["report"]["outcome"] == OutcomeStatus.RESOLVED
+    assert record["report"]["verified"] is False
+    assert record["effective_status"] == OutcomeStatus.NEEDS_HUMAN
+    assert events_file.read_text(encoding="utf-8").splitlines() == [
+        "verify:https://fake.test/F-1",
+        "annotate:F-1",
+        "block:F-1",
+    ]
