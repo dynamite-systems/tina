@@ -81,10 +81,11 @@ keeps two in-tree connectors: GitHub, and a `file` connector that reads work
 items from a JSONL file and claims with a sidecar marker — the connector the
 demo and the tests use, and the one a new author copies.
 
-Conformance is a command, not a test module: `tina connector-check <command>`
-drives any executable through the protocol — framing, handshake, every
-method's shape, the error shape, shutdown — so a connector author's CI proves
-compatibility in their language without importing anything of Tina's.
+Conformance is planned as a command, not a test module (`tina connector-check
+<command>`, not yet implemented): it will drive any executable through the
+protocol — framing, handshake, every method's shape, the error shape, shutdown
+— so a connector author's CI proves compatibility in their language without
+importing anything of Tina's.
 
 Executors are the same shape and get the same treatment later; this decision
 scopes to sources, where the need is.
@@ -132,8 +133,9 @@ reopen.
 - Tina's config schema shrinks to Tina's own keys. `repo`, `labels`,
   `project`, `status`, `filters`, `extra`, `claim_transition`, and
   `blocked_transition` become each connector's business, validated by the
-  connector at `initialize` — so `tina validate` and `tina doctor` still fail
-  at load time, by asking the process instead of a pydantic model. This is a
+  connector at `initialize` — currently checked by `tina doctor` and runtime
+  commands at connector initialization (`tina validate` remains static-only and
+  does not initialize connector options yet; integration is deferred). This is a
   breaking config change; the migration is mechanical (move keys under
   `[<track>.options]`) and ships with an upgrade note.
 - `tina.query` and the tracker-specific half of `tina.verify` move into the

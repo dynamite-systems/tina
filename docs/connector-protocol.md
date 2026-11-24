@@ -29,9 +29,9 @@ proves a pull request exists — lives behind this protocol, in the connector.
 - Requests carry a JSON-RPC `id` and expect exactly one response. Tina sends
   one request at a time and waits; a connector need not handle concurrency.
 - One connector process serves one Tina invocation (`dispatch`, `run`,
-  `status`, `doctor`, `validate`). Tina spawns it on first use, sends
-  `shutdown` when done, closes `stdin`, waits a grace period (5 s), then
-  kills it.
+  `status`, `doctor`; `validate` integration is deferred). Tina spawns it on
+  first use, sends `shutdown` when done, closes `stdin`, waits a grace period
+  (5 s), then kills it.
 - Every request has a timeout, 120 s unless `[sources.<name>] timeout` says
   otherwise. A connector that does not answer in time is a source error. A
   connector's own retry waits — a tracker's documented rate-limit backoff —
@@ -64,9 +64,9 @@ generic lifecycle settings the connector needs to interpret them.
   run at load, not later.
 - **`options` is where the connector validates its configuration.** Unknown
   keys, missing required keys, and malformed values are answered with error
-  `-32002` and a `fix`. This is what makes `tina validate` and `tina doctor`
-  catch a typo in `[vul.options]` before any run: they initialize the
-  connector and stop.
+  `-32002` and a `fix`. `tina doctor` and runtime commands initialize the
+  connector to catch a typo in `[vul.options]`; `tina validate` remains
+  static-only and does not initialize connectors yet (integration deferred).
 - `lifecycle` mirrors the track keys Tina owns and the connector needs:
   `claim` (`"assign"`, `"label"`, or `"none"`), `claim_label`, and
   `blocked_label`. A connector implements claiming and blocking with them.
@@ -106,7 +106,7 @@ Declared in `initialize`'s `capabilities`; called only when declared.
 | Method | Params | Result | Purpose |
 |---|---|---|---|
 | `build_query` | `{"options": {...}, "lifecycle": {...}}` | `{"query": str}` | Build the track's query from structured inputs when the track sets no `query`. The connector owns the universal predicates — queued, unassigned, not blocked, not claimed, stable order — for its tracker. |
-| `verify_artifact` | `{"url": str}` | `{"exists": bool}` or `null` | For artifact verification: whether the artifact behind a web URL exists, checked by the connector with its own credentials — a private repository's pull request is a 404 to an anonymous `GET`. `null` means "not mine"; Tina asks every configured connector and falls back to fetching the URL as given, anonymously. Credentials never cross the pipe. |
+| `verify_artifact` | `{"url": str}` | `{"exists": bool}` or `null` | For artifact verification: whether the artifact behind a web URL exists, checked by the connector with its own credentials — a private repository's pull request is a 404 to an anonymous `GET`. `null` means "not mine"; currently Tina asks only the track's own source connector and falls back to `tina.verify`'s URL mapping and ambient-environment authenticated `GET` (anonymous for unrecognized hosts). Credentials never cross the pipe. |
 
 ## 5. Errors
 
@@ -117,7 +117,7 @@ resolves it. Tina renders both.
 | Code | Meaning | Tina's reaction |
 |---|---|---|
 | `-32001` | unsupported protocol version; `data.supported` lists the connector's | fail at load |
-| `-32002` | invalid options; `data.fix` names the key | fail at load (`validate`, `doctor`, `dispatch`, `run`) |
+| `-32002` | invalid options; `data.fix` names the key | fail at connector initialization (`doctor`, `dispatch`, `run`, `status`; `validate` integration is deferred) |
 | `-32003` | the tracker refused or could not be reached | `SourceError` — the command exits 1 with the message |
 | `-32004` | no such item | `SourceError` |
 | `-32600` … `-32603` | JSON-RPC's own: malformed request, unknown method, invalid params, internal | protocol error; the connector is at fault |
@@ -157,7 +157,8 @@ JSON block the agent sees in its prompt is what the connector sent.
 
 ## 8. Conformance
 
-`tina connector-check <command>` drives a connector through this document:
+`tina connector-check <command>` *(planned, not yet implemented)* will drive a
+connector through this document:
 the handshake with a supported and an unsupported version, an `initialize`
 with bad options, every method's response shape, the error shape, `stderr`
 relaying, and `shutdown`. It needs the connector's own environment

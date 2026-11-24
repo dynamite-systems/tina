@@ -26,7 +26,8 @@ class OptionsError(Exception):
     """The `[<track>.options]` table is not one this connector accepts.
 
     Raised from `Connector.__init__`; answered as error -32002 with `fix`, which
-    is what lets `tina validate` and `tina doctor` catch a bad table at load.
+    lets `tina doctor` and runtime commands catch a bad table at connector
+    initialization (`tina validate` integration is deferred).
     """
 
     def __init__(self, message: str, fix: str = "") -> None:
