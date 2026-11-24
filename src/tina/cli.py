@@ -884,6 +884,12 @@ def _preview_run(
     logger.info("would run", extra=fields)
 
 
+def _preview_command(command: list[str], outcome_file: Path) -> str:
+    """Format a runnable shell command with `TINA_OUTCOME_PATH` prefixed."""
+    outcome_env = f"{harness.OUTCOME_PATH_VAR}={shlex.quote(str(outcome_file))}"
+    return f"{outcome_env} {shlex.join(command)}"
+
+
 def _preview_prompt(config: Config, track: TrackConfig, item: WorkItem | None) -> dict[str, Any]:
     """Assemble the genuine prompt and render the genuine command.
 
@@ -895,14 +901,15 @@ def _preview_prompt(config: Config, track: TrackConfig, item: WorkItem | None) -
     """
     harness_config = config.harness_config()
     workdir = Path(tempfile.mkdtemp(prefix="tina-"))
-    text = prompt.build(config.track_dir(track), item, harness.outcome_path(workdir))
+    outcome_file = harness.outcome_path(workdir)
+    text = prompt.build(config.track_dir(track), item, outcome_file)
     prompt_file = harness.write_prompt(text, workdir)
     command = harness_config.command.render(
         prompt_file, workdir, model=track.model, session_dir=harness.session_path(workdir)
     )
 
     output.would(f"Prompt assembled: {prompt_file} ({len(text)} chars)")
-    output.would(f"Would run: {shlex.join(command)}")
+    output.would(f"Would run: {_preview_command(command, outcome_file)}")
     output.would("Would verify artifacts and record the outcome from the agent's outcome.json")
 
     return {
