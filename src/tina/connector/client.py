@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import atexit
 import collections
+import contextlib
 import os
 import shlex
 import subprocess
@@ -98,22 +99,27 @@ class ConnectorClient:
         threading.Thread(target=self._relay_stderr, daemon=True).start()
         log.info("connector started", extra={"source": self.name, "command": self.command})
 
-        answer = self._call(
-            "initialize",
-            {
-                "protocol_version": protocol.PROTOCOL_VERSION,
-                "client": {"name": "tina", "version": _tina_version()},
-                "track": self.track,
-                "options": self.options,
-                "lifecycle": self.lifecycle.model_dump(),
-            },
-        )
-        initialized = InitializeResult.model_validate(answer)
+        try:
+            answer = self._call(
+                "initialize",
+                {
+                    "protocol_version": protocol.PROTOCOL_VERSION,
+                    "client": {"name": "tina", "version": _tina_version()},
+                    "track": self.track,
+                    "options": self.options,
+                    "lifecycle": self.lifecycle.model_dump(),
+                },
+            )
+            initialized = InitializeResult.model_validate(answer)
+        except Exception:
+            self.close()
+            raise
         self._capabilities = initialized.capabilities
         self._connector = initialized.connector
 
     def close(self) -> None:
         """`shutdown`, close stdin, wait a grace period, then kill. Idempotent."""
+        atexit.unregister(self.close)
         process, self._process = self._process, None
         if process is None or process.poll() is not None:
             return
@@ -123,8 +129,7 @@ class ConnectorClient:
                 process.stdin.close()
             process.wait(timeout=SHUTDOWN_GRACE)
         except (OSError, ValueError, subprocess.TimeoutExpired):
-            process.kill()
-            process.wait()
+            _reap(process)
 
     def __enter__(self) -> ConnectorClient:
         return self
@@ -191,18 +196,18 @@ class ConnectorClient:
         return SourceError(f"{self.name}: {method}: {message}", fix=fix)
 
     def _died(self, method: str) -> SourceError:
-        process = self._process
+        atexit.unregister(self.close)
+        process, self._process = self._process, None
         code = process.poll() if process is not None else None
         tail = "\n".join(self._stderr_tail)
         detail = (
             f"exited {code}" if code is not None else f"gave no answer within {self.timeout:g}s"
         )
         if process is not None and code is None:
-            process.kill()
-        self._process = None
+            _reap(process)
         return SourceError(
             f"{self.name}: connector {detail} during {method}" + (f":\n{tail}" if tail else ""),
-            fix="Run the connector by hand, or `tina connector-check`, to see why.",
+            fix="Run the connector command by hand and inspect its stderr to see why.",
         )
 
     # -- the Source contract ----------------------------------------------------------
@@ -230,10 +235,22 @@ class ConnectorClient:
         return _items(self._call("claimed", {"query": q}))
 
     def annotate(self, item: WorkItem, comment: str) -> None:
-        self._call("annotate", {"item": item.model_dump(mode="json"), "comment": comment})
+        """Leave a comment about a run. Best-effort: log `SourceError`, never raise."""
+        try:
+            self._call("annotate", {"item": item.model_dump(mode="json"), "comment": comment})
+        except SourceError as exc:
+            log.warning(
+                "annotate failed", extra={"source": self.name, "item": item.id, "error": str(exc)}
+            )
 
     def block(self, item: WorkItem) -> None:
-        self._call("block", {"item": item.model_dump(mode="json")})
+        """Apply the exclusion marker. Best-effort: log `SourceError`, never raise."""
+        try:
+            self._call("block", {"item": item.model_dump(mode="json")})
+        except SourceError as exc:
+            log.warning(
+                "block failed", extra={"source": self.name, "item": item.id, "error": str(exc)}
+            )
 
     # -- optional capabilities -----------------------------------------------------------
 
@@ -256,7 +273,15 @@ class ConnectorClient:
 
 
 class OptionsRejected(SourceError):
-    """The connector refused `[<track>.options]` — a config error, surfaced at load."""
+    """The connector refused `[<track>.options]` during initialization."""
+
+
+def _reap(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        process.kill()
+    process.wait()
 
 
 def _items(answer: dict[str, Any]) -> list[WorkItem]:

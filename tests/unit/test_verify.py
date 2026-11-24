@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+import logging
 
 import httpx
 import pytest
 
 from tina import verify
 from tina.models import Artifact, OutcomeReport, OutcomeStatus
+from tina.sources.base import SourceError
 
 
 def report(status: OutcomeStatus, *urls: str) -> OutcomeReport:
@@ -246,3 +248,30 @@ def test_verification_re_mints_a_github_token_on_401(
 
     assert result.verified is True
     assert seen == ["Bearer ghs_stale", "Bearer ghs_fresh"]
+
+
+def test_connector_verify_source_error_fails_closed_without_fallback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A connector SourceError during verification records failure without falling back to HTTP."""
+    http_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        http_calls.append(str(request.url))
+        return httpx.Response(200)
+
+    def faulting_check(url: str) -> bool | None:
+        raise SourceError("fake: connector exited 1 during verify_artifact")
+
+    with caplog.at_level(logging.WARNING):
+        result = verify.verify(
+            report(OutcomeStatus.RESOLVED, "https://example.test/pr/1"),
+            client(handler),
+            check=faulting_check,
+        )
+
+    assert result.verified is False
+    assert result.outcome is OutcomeStatus.RESOLVED
+    assert result.effective_status is OutcomeStatus.NEEDS_HUMAN
+    assert http_calls == []
+    assert any("artifact unreachable" in record.message for record in caplog.records)

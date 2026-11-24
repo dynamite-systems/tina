@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -24,6 +25,10 @@ class Options(BaseModel):
     items: int = 1
     # Makes `login` hang, for the client's timeout test.
     sleep_on_login: float = 0.0
+    fail_annotate: bool = False
+    fail_block: bool = False
+    fail_verify: bool = False
+    events_file: str | None = None
 
 
 class FakeConnector(Connector):
@@ -74,10 +79,21 @@ class FakeConnector(Connector):
     def claimed(self, q: str) -> list[WorkItem]:
         return []
 
+    def _record_event(self, event: str) -> None:
+        if self.opts.events_file:
+            with Path(self.opts.events_file).open("a", encoding="utf-8") as handle:
+                handle.write(f"{event}\n")
+
     def annotate(self, item: WorkItem, comment: str) -> None:
+        self._record_event(f"annotate:{item.id}")
+        if self.opts.fail_annotate:
+            raise SourceError("fake: annotate refused")
         print(f"annotated {item.id}: {comment}", file=sys.stderr)
 
     def block(self, item: WorkItem) -> None:
+        self._record_event(f"block:{item.id}")
+        if self.opts.fail_block:
+            raise SourceError("fake: block refused")
         print(f"blocked {item.id}", file=sys.stderr)
 
     def build_query(self) -> str:
@@ -87,6 +103,9 @@ class FakeConnector(Connector):
         return " ".join(parts)
 
     def verify_artifact(self, url: str) -> bool | None:
+        self._record_event(f"verify:{url}")
+        if self.opts.fail_verify:
+            raise SourceError("fake: verify refused")
         if not url.startswith("https://fake.test/"):
             return None
         return not url.endswith("/missing")

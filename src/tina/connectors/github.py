@@ -20,7 +20,7 @@ from __future__ import annotations
 import re
 import sys
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -30,11 +30,11 @@ from tina import query as query_builders
 from tina.connector.protocol import Lifecycle
 from tina.connector.server import Connector, OptionsError, serve
 from tina.models import WorkItem
-from tina.sources.base import ClaimPrognosis
+from tina.sources.base import ClaimPrognosis, SourceError
 from tina.sources.github import GitHubSource
-from tina.verify import api_url, auth_headers
+from tina.verify import api_url
 
-_GITHUB_HOSTS = ("github.com", "api.github.com")
+_GITHUB_WEB_HOSTS = frozenset({"github.com", "www.github.com"})
 
 _REPO = re.compile(r"^[\w.-]+/[\w.-]+$")
 
@@ -118,17 +118,71 @@ class GitHubConnector(Connector):
         )
 
     def verify_artifact(self, url: str) -> bool | None:
-        """Whether a github.com artifact exists, checked here with this process's
-        own credentials — never handed to Tina. None for a URL that is not GitHub's."""
-        host = (urlsplit(url).hostname or "").lower()
-        if not any(host == h or host.endswith("." + h) for h in _GITHUB_HOSTS):
+        """Whether a trusted GitHub artifact exists, checked here with this
+        process's own credentials and 401 refresh semantics — never handed to
+        Tina. None for a URL that is not on an exact trusted GitHub host."""
+        api_path = self._api_path(url)
+        if api_path is not None:
+            return self._check_api(api_path)
+
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        if parts.scheme.lower() != "https" or host not in _GITHUB_WEB_HOSTS or _port(parts) != 443:
             return None
+
         target = api_url(url)
+        mapped_path = self._api_path(target)
+        if mapped_path is not None:
+            return self._check_api(mapped_path)
+        return self._check_web(url)
+
+    def _api_path(self, url: str) -> str | None:
+        parts = urlsplit(url)
+        api = urlsplit(self.source.api_base)
+        if (
+            parts.scheme.lower() != api.scheme.lower()
+            or (parts.hostname or "").lower() != (api.hostname or "").lower()
+            or _port(parts) != _port(api)
+        ):
+            return None
+        prefix = api.path.rstrip("/")
+        if prefix and parts.path != prefix and not parts.path.startswith(f"{prefix}/"):
+            return None
+        path = parts.path[len(prefix) :] or "/"
+        if not path.startswith("/"):
+            return None
+        return f"{path}?{parts.query}" if parts.query else path
+
+    def _check_api(self, path: str) -> bool:
         try:
-            response = self.source.client.get(target, headers=auth_headers(target))
+            response = self.source._request("GET", path)
+        except SourceError:
+            return False
+        return 200 <= response.status_code < 400
+
+    def _check_web(self, url: str) -> bool:
+        try:
+            response = self.source.client.get(url)
+            if response.status_code == 401 and self.source._token_command is not None:
+                self.source.client.headers["Authorization"] = f"Bearer {self.source._fresh_token()}"
+                response = self.source.client.get(url)
         except httpx.HTTPError:
             return False
         return 200 <= response.status_code < 400
+
+
+def _port(parts: SplitResult) -> int | None:
+    try:
+        if parts.port is not None:
+            return parts.port
+    except ValueError:
+        return -1
+    scheme = parts.scheme.lower()
+    if scheme == "https":
+        return 443
+    if scheme == "http":
+        return 80
+    return None
 
 
 def main() -> None:

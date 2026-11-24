@@ -6,7 +6,9 @@ way Tina runs any connector: a command, stdin, stdout, stderr.
 
 from __future__ import annotations
 
+import atexit
 import json
+import logging
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -164,3 +166,81 @@ def test_the_fake_runs_from_the_repo_root_as_tina_would_run_it() -> None:
     )
     assert completed.returncode == 0
     assert '"connector": {"name": "fake", "version": "9"}' in completed.stdout
+
+
+def test_annotate_failure_is_logged_and_swallowed_so_block_still_runs(
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Best-effort write-back: a faulting annotate never escapes or prevents block."""
+    c = client(options={"items": 1, "fail_annotate": True})
+    item = WorkItem(id="F-1", source="fake")
+    try:
+        with caplog.at_level(logging.WARNING):
+            c.annotate(item, "run ended failed")
+        c.block(item)
+    finally:
+        c.close()
+
+    assert any("annotate failed" in record.message for record in caplog.records)
+    assert "[fake] blocked F-1" in capsys.readouterr().err
+
+
+def test_block_failure_is_logged_and_swallowed(caplog: pytest.LogCaptureFixture) -> None:
+    """Best-effort write-back: a faulting block logs and returns without raising."""
+    c = client(options={"items": 1, "fail_block": True})
+    item = WorkItem(id="F-1", source="fake")
+    try:
+        with caplog.at_level(logging.WARNING):
+            c.block(item)
+    finally:
+        c.close()
+
+    assert any("block failed" in record.message for record in caplog.records)
+
+
+def test_timeout_reaps_killed_child_unregisters_atexit_and_drops_nonexistent_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timed-out connectors are killed, reaped, unregistered from atexit, and omit dead hints."""
+    unregistered: list[Any] = []
+    real_unregister = atexit.unregister
+
+    def spy_unregister(func: Any) -> None:
+        unregistered.append(func)
+        real_unregister(func)
+
+    monkeypatch.setattr(atexit, "unregister", spy_unregister)
+    c = client(options={"items": 1, "sleep_on_login": 30}, timeout=0.3)
+    assert c.capabilities.build_query is True
+    process = c._process
+    assert process is not None
+
+    with pytest.raises(SourceError, match="gave no answer within 0.3s during login") as excinfo:
+        c.login()
+
+    assert process.returncode is not None
+    assert c._process is None
+    assert c.close in unregistered
+    assert "connector-check" not in excinfo.value.fix
+    c.close()
+
+
+def test_close_unregisters_atexit_idempotently(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Closing a client unregisters its atexit callback and remains idempotent."""
+    unregistered: list[Any] = []
+    real_unregister = atexit.unregister
+
+    def spy_unregister(func: Any) -> None:
+        unregistered.append(func)
+        real_unregister(func)
+
+    monkeypatch.setattr(atexit, "unregister", spy_unregister)
+    c = client()
+    c.login()
+    process = c._process
+    assert process is not None
+
+    c.close()
+    assert process.returncode == 0
+    assert c.close in unregistered
+    c.close()

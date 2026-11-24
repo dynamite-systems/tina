@@ -30,6 +30,7 @@ import httpx
 from tina import credentials
 from tina.log import get_logger
 from tina.models import OutcomeReport, OutcomeStatus
+from tina.sources.base import SourceError
 
 log = get_logger(__name__)
 
@@ -67,7 +68,14 @@ def verify(
 
 def _verdict(client: httpx.Client, url: str, check: Check | None) -> bool:
     if check is not None:
-        answer = check(url)
+        try:
+            answer = check(url)
+        except SourceError as exc:
+            log.warning(
+                "artifact unreachable",
+                extra={"url": url, "checked": "connector", "error": str(exc)},
+            )
+            return False
         if answer is not None:
             if not answer:
                 log.warning("artifact missing", extra={"url": url, "checked": "connector"})
