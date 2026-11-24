@@ -19,8 +19,9 @@ from typer.testing import CliRunner
 
 import tina
 from tina import cli, config, control, executors, harness, log, sources, verify
+from tina.config import Config, TrackConfig
 from tina.models import OutcomeReport, OutcomeStatus, WorkItem
-from tina.sources.base import ClaimPrognosis
+from tina.sources.base import ClaimPrognosis, Source
 
 # The one URL the stubbed verifier considers real.
 GOOD_ARTIFACT = "https://example.test/pr/1"
@@ -2332,7 +2333,11 @@ def test_run_records_outcome_and_attempts_block_when_connector_faults(
     built: list[Any] = []
     real_build = sources.build
 
-    def tracking_build(track_cfg, client=None, config=None):
+    def tracking_build(
+        track_cfg: TrackConfig,
+        client: httpx.Client | None = None,
+        config: Config | None = None,
+    ) -> Source:
         src = real_build(track_cfg, client=client, config=config)
         built.append(src)
         return src

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -25,7 +26,9 @@ def _token_command(monkeypatch: pytest.MonkeyPatch, tokens: list[str], tmp_path:
     monkeypatch.setenv("GITHUB_TOKEN_COMMAND", f"{sys.executable} {script}")
 
 
-def _attach_mock(connector: GitHubConnector, handler) -> None:
+def _attach_mock(
+    connector: GitHubConnector, handler: Callable[[httpx.Request], httpx.Response]
+) -> None:
     connector.source.client = httpx.Client(
         transport=httpx.MockTransport(handler),
         headers=connector.source.client.headers,
