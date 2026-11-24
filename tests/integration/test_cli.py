@@ -5,9 +5,12 @@ import importlib.metadata
 import io
 import json
 import logging
+import os
 import re
 import shlex
+import subprocess
 import sys
+import tempfile
 from collections.abc import Iterator
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
@@ -1725,12 +1728,37 @@ def test_the_dry_run_command_is_the_one_a_real_run_would_invoke(
     assert line["command"] == expected
 
 
+def _would_run_command(stderr: str) -> str:
+    """Extract the printed shell command from a dry-run preview on stderr."""
+    prefix = "  Would run: "
+    for line in plain(stderr).splitlines():
+        if line.startswith(prefix):
+            return line.removeprefix(prefix)
+    raise AssertionError(f"missing {prefix!r} line in preview: {stderr!r}")
+
+
+def _env_outcome_agent_script() -> str:
+    """Return a fake harness script that writes outcome.json solely via TINA_OUTCOME_PATH."""
+    return (
+        "import json, os, pathlib, sys\n"
+        "prompt = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')\n"
+        f"assert '\"${harness.OUTCOME_PATH_VAR}\"' in prompt\n"
+        f"target = pathlib.Path(os.environ[{harness.OUTCOME_PATH_VAR!r}])\n"
+        "target.write_text(\n"
+        "    json.dumps({'outcome': 'resolved', 'details': 'reported through env var'}),\n"
+        "    encoding='utf-8',\n"
+        ")\n"
+    )
+
+
 def test_the_run_preview_lands_on_stderr(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Header, the four steps in order, footer — and none of it on stdout."""
     wire(monkeypatch, FakeSource(items("VUL-1")))
 
     result = runner.invoke(cli.app, [*DRY_RUN_ARGV, "--config", str(project)])
     line = last_record(result.stdout)
+    outcome_file = harness.outcome_path(Path(line["prompt_file"]).parent)
+    outcome_env = f"{harness.OUTCOME_PATH_VAR}={shlex.quote(str(outcome_file))}"
 
     assert result.exit_code == 0
     assert plain(result.stderr).splitlines() == [
@@ -1738,12 +1766,95 @@ def test_the_run_preview_lands_on_stderr(project: Path, monkeypatch: pytest.Monk
         "",
         "  Would claim VUL-1 — unassigned",
         f"  Prompt assembled: {line['prompt_file']} ({line['prompt_chars']} chars)",
-        f"  Would run: {shlex.join(line['command'])}",
+        f"  Would run: {outcome_env} {shlex.join(line['command'])}",
         "  Would verify artifacts and record the outcome from the agent's outcome.json",
         "",
         "Run without --dry-run to claim VUL-1 and run the agent.",
     ]
     assert "Would claim" not in result.stdout, "the preview is prose; stdout stays JSON"
+
+
+@pytest.mark.parametrize(
+    "temp_subdir",
+    ["plain-tmp", "dir with 'single' \"double\" and $HOME"],
+)
+def test_the_dry_run_command_exports_outcome_path_when_executed(
+    project: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    temp_subdir: str,
+) -> None:
+    """Copy-pasting the preview command sets TINA_OUTCOME_PATH without leaking other env."""
+    wire(monkeypatch, NoClaimSource(items("VUL-1")))
+
+    def fail_executor(cfg: config.Config) -> executors.Executor:
+        raise AssertionError("executors.build must not be called for a dry run")
+
+    def fail_harness(*args: Any, **kwargs: Any) -> harness.HarnessResult:
+        raise AssertionError("harness.run must not be called for a dry run")
+
+    monkeypatch.setattr(executors, "build", fail_executor)
+    monkeypatch.setattr(harness, "run", fail_harness)
+    monkeypatch.delenv(harness.OUTCOME_PATH_VAR, raising=False)
+    monkeypatch.setenv("JIRA_API_TOKEN", "ambient-jira-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "ambient-github-secret")
+
+    temp_root = tmp_path / temp_subdir
+    temp_root.mkdir(parents=True)
+    monkeypatch.setenv("TMPDIR", str(temp_root))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+
+    project.write_text(
+        project.read_text(encoding="utf-8") + '\n[vul.env]\nTRACK_SECRET = "track-secret-value"\n',
+        encoding="utf-8",
+    )
+    (project.parent / "agent.py").write_text(_env_outcome_agent_script(), encoding="utf-8")
+
+    result = runner.invoke(cli.app, [*DRY_RUN_ARGV, "--config", str(project)])
+    line = last_record(result.stdout)
+    prompt_file = Path(line["prompt_file"])
+    outcome_file = harness.outcome_path(prompt_file.parent)
+    expected_argv = (
+        config.load(project).harness_config().command.render(prompt_file, prompt_file.parent)
+    )
+
+    assert result.exception is None
+    assert result.exit_code == 0
+    assert line["message"] == "would run"
+    assert line["command"] == expected_argv
+    assert outcome_file.is_relative_to(temp_root)
+    assert harness.OUTCOME_PATH_VAR not in os.environ
+    assert not outcome_file.exists()
+
+    for secret in (
+        "ambient-jira-secret",
+        "ambient-github-secret",
+        "track-secret-value",
+        "TRACK_SECRET",
+    ):
+        assert secret not in result.stderr
+        assert secret not in result.stdout
+
+    printed_command = _would_run_command(result.stderr)
+    assert f"{harness.OUTCOME_PATH_VAR}={shlex.quote(str(outcome_file))}" in printed_command
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    shell_env = {k: v for k, v in os.environ.items() if k != harness.OUTCOME_PATH_VAR}
+    completed = subprocess.run(
+        ["/bin/sh", "-c", printed_command],
+        check=False,
+        cwd=elsewhere,
+        env=shell_env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert outcome_file.exists()
+    report = harness.read_outcome(outcome_file, completed.returncode)
+    assert report.outcome is OutcomeStatus.RESOLVED
+    assert report.details == "reported through env var"
 
 
 def test_a_normal_run_is_unaffected(project: Path, wired: tuple[FakeSource, FakeExecutor]) -> None:
@@ -2141,6 +2252,8 @@ def test_a_sweep_dry_run_previews_the_command(
         cli.app, ["run", "--track", "reap", "--config", str(sweep_project), "--dry-run"]
     )
     line = last_record(result.stdout)
+    outcome_file = harness.outcome_path(Path(line["prompt_file"]).parent)
+    outcome_env = f"{harness.OUTCOME_PATH_VAR}={shlex.quote(str(outcome_file))}"
 
     assert result.exception is None
     assert result.exit_code == 0
@@ -2148,7 +2261,84 @@ def test_a_sweep_dry_run_previews_the_command(
     assert line["item"] == "sweep"
     assert "command" in line
     assert set(line) & {"matches", "would_claim", "holder"} == set(), "nothing to claim or re-check"
-    assert "Would run:" in plain(result.stderr)
+    assert (
+        f"  Would run: {outcome_env} {shlex.join(line['command'])}"
+        in plain(result.stderr).splitlines()
+    )
+
+
+def test_a_sweep_dry_run_command_exports_outcome_path_when_executed(
+    sweep_project: Path,
+    tmp_path: Path,
+    no_source: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sweep dry-run preview command exports TINA_OUTCOME_PATH safely when run."""
+
+    def fail_executor(cfg: config.Config) -> executors.Executor:
+        raise AssertionError("executors.build must not be called for a dry run")
+
+    def fail_harness(*args: Any, **kwargs: Any) -> harness.HarnessResult:
+        raise AssertionError("harness.run must not be called for a dry run")
+
+    monkeypatch.setattr(executors, "build", fail_executor)
+    monkeypatch.setattr(harness, "run", fail_harness)
+    monkeypatch.delenv(harness.OUTCOME_PATH_VAR, raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "ambient-sweep-secret")
+
+    temp_root = tmp_path / "sweep 'quoted' dir"
+    temp_root.mkdir(parents=True)
+    monkeypatch.setenv("TMPDIR", str(temp_root))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+
+    sweep_project.write_text(
+        sweep_project.read_text(encoding="utf-8")
+        + '\n[reap.env]\nSWEEP_SECRET = "sweep-secret-value"\n',
+        encoding="utf-8",
+    )
+    (sweep_project.parent / "agent.py").write_text(_env_outcome_agent_script(), encoding="utf-8")
+
+    result = runner.invoke(
+        cli.app, ["run", "--track", "reap", "--config", str(sweep_project), "--dry-run"]
+    )
+    line = last_record(result.stdout)
+    prompt_file = Path(line["prompt_file"])
+    outcome_file = harness.outcome_path(prompt_file.parent)
+    expected_argv = (
+        config.load(sweep_project).harness_config().command.render(prompt_file, prompt_file.parent)
+    )
+
+    assert result.exception is None
+    assert result.exit_code == 0
+    assert line["message"] == "would run"
+    assert line["item"] == "sweep"
+    assert line["command"] == expected_argv
+    assert outcome_file.is_relative_to(temp_root)
+    assert harness.OUTCOME_PATH_VAR not in os.environ
+    assert not outcome_file.exists()
+
+    for secret in ("ambient-sweep-secret", "sweep-secret-value", "SWEEP_SECRET"):
+        assert secret not in result.stderr
+        assert secret not in result.stdout
+
+    printed_command = _would_run_command(result.stderr)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    shell_env = {k: v for k, v in os.environ.items() if k != harness.OUTCOME_PATH_VAR}
+    completed = subprocess.run(
+        ["/bin/sh", "-c", printed_command],
+        check=False,
+        cwd=elsewhere,
+        env=shell_env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert outcome_file.exists()
+    report = harness.read_outcome(outcome_file, completed.returncode)
+    assert report.outcome is OutcomeStatus.RESOLVED
+    assert report.details == "reported through env var"
 
 
 def test_status_refuses_a_sweep_track(sweep_project: Path, no_source: None) -> None:
