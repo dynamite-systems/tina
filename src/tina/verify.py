@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import os
 import re
+from collections.abc import Callable
 from urllib.parse import urlsplit
 
 import httpx
@@ -29,17 +30,26 @@ import httpx
 from tina import credentials
 from tina.log import get_logger
 from tina.models import OutcomeReport, OutcomeStatus
+from tina.sources.base import SourceError
 
 log = get_logger(__name__)
 
 TIMEOUT = 30.0
 
 
-def verify(report: OutcomeReport, client: httpx.Client | None = None) -> OutcomeReport:
+Check = Callable[[str], bool | None]
+
+
+def verify(
+    report: OutcomeReport, client: httpx.Client | None = None, check: Check | None = None
+) -> OutcomeReport:
     """Set `verified` on the report when there is something to check.
 
     The other three outcomes, and `resolved` with no artifacts, have nothing to
-    check and leave `verified` as None.
+    check and leave `verified` as None. `check` is a connector's
+    `verify_artifact` (ADR-019): asked first, with its own credentials on its
+    own side of the pipe; None from it means "not mine" and the generic GET
+    applies.
     """
     if report.outcome is not OutcomeStatus.RESOLVED or not report.artifacts:
         return report
@@ -47,11 +57,30 @@ def verify(report: OutcomeReport, client: httpx.Client | None = None) -> Outcome
     owned = client is None
     client = client or httpx.Client(timeout=TIMEOUT, follow_redirects=False)
     try:
-        report.verified = all(_exists(client, str(artifact.url)) for artifact in report.artifacts)
+        report.verified = all(
+            _verdict(client, str(artifact.url), check) for artifact in report.artifacts
+        )
     finally:
         if owned:
             client.close()
     return report
+
+
+def _verdict(client: httpx.Client, url: str, check: Check | None) -> bool:
+    if check is not None:
+        try:
+            answer = check(url)
+        except SourceError as exc:
+            log.warning(
+                "artifact unreachable",
+                extra={"url": url, "checked": "connector", "error": str(exc)},
+            )
+            return False
+        if answer is not None:
+            if not answer:
+                log.warning("artifact missing", extra={"url": url, "checked": "connector"})
+            return answer
+    return _exists(client, url)
 
 
 def _exists(client: httpx.Client, url: str) -> bool:
