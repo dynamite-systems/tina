@@ -144,11 +144,14 @@ def _refresh_github_token(url: str) -> bool:
 
 
 def _is_github(url: str) -> bool:
-    host = (urlsplit(url).hostname or "").lower()
-    api_host = (
-        urlsplit(os.environ.get("GITHUB_API_URL") or "https://api.github.com").hostname or ""
-    ).lower()
-    return _matches(host, "github.com") or host == api_host
+    """True when the URL is on a GitHub origin trusted with the token: the
+    github.com and api.github.com HTTPS origins, or the `GITHUB_API_URL`
+    origin when that is HTTPS."""
+    origin = _https_origin(url)
+    if origin is None:
+        return False
+    api = os.environ.get("GITHUB_API_URL") or "https://api.github.com"
+    return origin in {("github.com", 443), ("api.github.com", 443), _https_origin(api)}
 
 
 def auth_headers(url: str) -> dict[str, str]:
@@ -156,10 +159,10 @@ def auth_headers(url: str) -> dict[str, str]:
 
     Tina needs read access to systems it never writes to. Those credentials are
     already in the image for the agent, so this is env reuse rather than new
-    secrets plumbing. Anything unrecognized is fetched anonymously.
+    secrets plumbing. Credentials go only to an exact trusted HTTPS origin
+    (scheme, host, and effective port); anything else is fetched anonymously.
     """
-    host = (urlsplit(url).hostname or "").lower()
-    if not host:
+    if _https_origin(url) is None:
         return {}
 
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
@@ -170,15 +173,24 @@ def auth_headers(url: str) -> dict[str, str]:
     email = os.environ.get("JIRA_EMAIL")
     api_token = os.environ.get("JIRA_API_TOKEN")
     if jira_base and email and api_token:
-        jira_host = (urlsplit(jira_base).hostname or "").lower()
-        if jira_host and host == jira_host:
+        jira_origin = _https_origin(jira_base)
+        if jira_origin and _https_origin(url) == jira_origin:
             return {"Authorization": _basic(email, api_token)}
 
     return {}
 
 
-def _matches(host: str, domain: str) -> bool:
-    return host == domain or host.endswith(f".{domain}")
+def _https_origin(url: str) -> tuple[str, int] | None:
+    """The (host, effective port) of an HTTPS URL; None for any other scheme
+    or an unparseable authority."""
+    parts = urlsplit(url)
+    if parts.scheme.lower() != "https" or not parts.hostname:
+        return None
+    try:
+        port = parts.port or 443
+    except ValueError:
+        return None
+    return parts.hostname.lower(), port
 
 
 def _basic(user: str, password: str) -> str:
