@@ -98,7 +98,8 @@ def run(
     "Once" is per the harness's retry rules: a nonzero exit whose output
     carried a configured marker is re-run after the rule's wait, up to the
     length of its ladder. A harness with no rules is run exactly once, with
-    its output inherited rather than relayed.
+    its output sent straight to stderr rather than relayed — stderr either
+    way, since stdout is Tina's JSON records.
     """
     prompt_file = write_prompt(prompt, workdir)
 
@@ -158,8 +159,11 @@ def _run_with_retries(
     exit, or one no rule matches, ends the loop.
     """
     if not rules:
+        # Not piped — nothing needs to see it — but onto stderr all the same,
+        # because stdout is Tina's JSON records. The process's own descriptor 2,
+        # not `sys.stderr`, which need not be backed by a file.
         return subprocess.run(
-            command, check=False, cwd=workdir, env=env, timeout=timeout
+            command, check=False, cwd=workdir, env=env, timeout=timeout, stdout=2
         ).returncode
 
     spent = [0] * len(rules)

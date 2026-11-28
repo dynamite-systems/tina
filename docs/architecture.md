@@ -571,11 +571,12 @@ A harness table may carry `retry` rules: output markers that mean the
 failure clears on its own — a model provider shedding load, a per-minute
 quota — and a ladder of waits, one retry per entry. Rules are tried in
 configured order, most specific first, and the first that matches decides the
-schedule; once its ladder is spent the failure stands. With rules set, the
-harness's output is relayed line by line so the markers can be seen — to
-stderr, since stdout is Tina's JSON records. Without rules the output is
-inherited and the harness runs exactly once. Tina still never *parses* that
-output for an outcome: a marker is a reason to run again, not a report.
+schedule; once its ladder is spent the failure stands. The harness's output
+goes to stderr either way, since stdout is Tina's JSON records. With rules
+set, it is relayed line by line so the markers can be seen; without rules it
+is sent straight to stderr unread, and the harness runs exactly once. Tina
+still never *parses* that output for an outcome: a marker is a reason to run
+again, not a report.
 
 `{session_dir}` is where the harness leaves its session — the transcript, tool
 calls, and token costs the final message never shows. A command referencing it

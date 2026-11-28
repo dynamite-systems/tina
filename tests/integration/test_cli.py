@@ -344,6 +344,26 @@ def test_run_exits_zero_when_the_agent_reports_failed(
     assert last_record(result.output)["effective_status"] == OutcomeStatus.FAILED
 
 
+def test_harness_output_stays_off_tinas_stdout(
+    project: Path, wired: tuple[FakeSource, FakeExecutor], capfd: pytest.CaptureFixture[str]
+) -> None:
+    """A harness with no retry rules still keeps its prose off the JSON stream."""
+    script = project.parent / "agent.py"
+    script.write_text("print('HARNESS NON JSON', flush=True)\n" + AGENT)
+
+    result = runner.invoke(
+        cli.app, ["run", "--track", "vul", "--item", "VUL-1", "--config", str(project)]
+    )
+
+    out, err = capfd.readouterr()
+    assert result.exit_code == 0
+    assert "HARNESS NON JSON" in err
+    assert "HARNESS NON JSON" not in out + result.stdout, "stdout is Tina's JSON records"
+    lines = result.stdout.splitlines()
+    assert lines
+    assert all(isinstance(json.loads(line), dict) for line in lines)
+
+
 def test_a_queue_run_without_an_item_is_refused(project: Path) -> None:
     """--item is required exactly when the track has a queue to take it from."""
     result = runner.invoke(cli.app, ["run", "--track", "vul", "--config", str(project)])
