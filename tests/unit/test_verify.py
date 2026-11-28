@@ -246,3 +246,165 @@ def test_verification_re_mints_a_github_token_on_401(
 
     assert result.verified is True
     assert seen == ["Bearer ghs_stale", "Bearer ghs_fresh"]
+
+
+# --- credentials go only to trusted HTTPS origins -----------------------------
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://api.github.com/repos/o/r/issues/1",
+        "http://github.com/acme/api",
+        "https://api.github.com:8443/repos/o/r/issues/1",
+        "https://github.com:80/acme/api",
+        "https://gist.github.com/acme/1",
+        "https://evil.api.github.com/repos/o/r",
+        "ftp://api.github.com/repos/o/r",
+    ],
+)
+def test_github_token_is_withheld_off_the_trusted_https_origins(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+
+    assert verify.auth_headers(url) == {}
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.github.com/repos/o/r",
+        "https://api.github.com:443/repos/o/r",
+        "HTTPS://API.GITHUB.COM/repos/o/r",
+        "https://github.com/acme/api",
+    ],
+)
+def test_github_token_reaches_the_trusted_https_origins(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+
+    assert verify.auth_headers(url) == {"Authorization": "Bearer ghp_secret"}
+
+
+def test_github_enterprise_token_is_bound_to_the_configured_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    monkeypatch.setenv("GITHUB_API_URL", "https://ghe.example:8443/api/v3")
+
+    assert verify.auth_headers("https://ghe.example:8443/api/v3/repos/o/r") == {
+        "Authorization": "Bearer ghp_secret"
+    }
+    assert verify.auth_headers("https://ghe.example/api/v3/repos/o/r") == {}
+    assert verify.auth_headers("http://ghe.example:8443/api/v3/repos/o/r") == {}
+
+
+def test_an_insecure_github_enterprise_api_url_gets_no_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    monkeypatch.setenv("GITHUB_API_URL", "http://ghe.example/api/v3")
+
+    assert verify.auth_headers("http://ghe.example/api/v3/repos/o/r") == {}
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://acme.atlassian.net/rest/api/3/issue/VUL-1",
+        "https://acme.atlassian.net:8443/rest/api/3/issue/VUL-1",
+        "https://sub.acme.atlassian.net/rest/api/3/issue/VUL-1",
+    ],
+)
+def test_jira_credentials_are_withheld_off_the_configured_https_origin(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    monkeypatch.setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "bot@acme.test")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+
+    assert verify.auth_headers(url) == {}
+
+
+def test_an_insecure_jira_base_url_gets_no_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JIRA_BASE_URL", "http://jira.acme.test")
+    monkeypatch.setenv("JIRA_EMAIL", "bot@acme.test")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+
+    assert verify.auth_headers("http://jira.acme.test/rest/api/3/issue/VUL-1") == {}
+
+
+def test_a_direct_http_api_artifact_is_fetched_without_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-audit-token")
+    monkeypatch.setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "bot@acme.test")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    seen: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((str(request.url), request.headers.get("Authorization")))
+        return httpx.Response(200)
+
+    result = verify.verify(
+        report(
+            OutcomeStatus.RESOLVED,
+            "http://api.github.com/repos/o/r/issues/1",
+            "http://acme.atlassian.net/rest/api/3/issue/VUL-1",
+        ),
+        client(handler),
+    )
+
+    assert result.verified is True
+    assert seen == [
+        ("http://api.github.com/repos/o/r/issues/1", None),
+        ("http://acme.atlassian.net/rest/api/3/issue/VUL-1", None),
+    ]
+
+
+def test_an_http_tracker_web_url_is_checked_over_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_x")
+    monkeypatch.setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "bot@acme.test")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.scheme == "https"
+        seen.append(str(request.url))
+        return httpx.Response(200)
+
+    result = verify.verify(
+        report(
+            OutcomeStatus.RESOLVED,
+            "http://github.com/acme/api/pull/7",
+            "http://acme.atlassian.net/browse/VUL-1",
+        ),
+        client(handler),
+    )
+
+    assert result.verified is True
+    assert seen == [
+        "https://api.github.com/repos/acme/api/issues/7",
+        "https://acme.atlassian.net/rest/api/3/issue/VUL-1",
+    ]
+
+
+def test_a_401_off_the_trusted_origin_does_not_mint_a_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    marker = tmp_path / "minted"
+    script = tmp_path / "mint.py"
+    script.write_text(f"open({str(marker)!r}, 'w').close(); print('ghs_fresh')")
+    monkeypatch.setenv("GITHUB_TOKEN_COMMAND", f"{__import__('sys').executable} {script}")
+
+    result = verify.verify(
+        report(OutcomeStatus.RESOLVED, "http://api.github.com/repos/o/r"),
+        client(lambda request: httpx.Response(401)),
+    )
+
+    assert result.verified is False
+    assert not marker.exists()
