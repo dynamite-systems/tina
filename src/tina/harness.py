@@ -8,11 +8,13 @@ parsing per-harness output is where swappability rots. The agent writes
 
 from __future__ import annotations
 
+import codecs
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -156,15 +158,23 @@ def _run_with_retries(
     retried on the specific rule's schedule, and once that ladder is spent the
     failure stands rather than falling through to the vaguer rule. A clean
     exit, or one no rule matches, ends the loop.
+
+    `timeout` bounds the whole sequence — every attempt and every wait — not
+    each attempt: the run holds a claim for as long as it lasts. A wait that
+    would reach the deadline is not slept; the run times out instead.
     """
     if not rules:
         return subprocess.run(
             command, check=False, cwd=workdir, env=env, timeout=timeout
         ).returncode
 
+    deadline = time.monotonic() + timeout
     spent = [0] * len(rules)
     while True:
-        returncode, output = _run_relaying(command, workdir, env, timeout)
+        try:
+            returncode, output = _run_relaying(command, workdir, env, deadline - time.monotonic())
+        except subprocess.TimeoutExpired as exc:
+            raise subprocess.TimeoutExpired(command, timeout, output=exc.output) from None
         if returncode == 0:
             return returncode
         # The first rule that matches decides — a spent ladder on that rule ends
@@ -173,6 +183,8 @@ def _run_with_retries(
         if index is None or spent[index] >= len(rules[index].waits):
             return returncode
         wait = rules[index].waits[spent[index]]
+        if wait >= deadline - time.monotonic():
+            raise subprocess.TimeoutExpired(command, timeout, output=output)
         spent[index] += 1
         log.warning(
             "harness failed on a retryable condition; retrying",
@@ -188,35 +200,67 @@ def _run_relaying(
     timeout: float,
     echo: bool = True,
 ) -> tuple[int, str]:
-    """Run the command with its output piped, line by line.
+    """Run the command with its output piped, relayed as it arrives.
 
     Piped rather than inherited so the retry markers can be seen, and — when
     `echo` is on — relayed as it arrives so a log collector still gets the run
     as it happens instead of one block at the end. Stderr, because stdout is
     Tina's JSON records. A probe turns `echo` off: its output is a verdict to
     summarize, not a run to follow.
+
+    The pipe is drained on a thread so `timeout` holds however the harness
+    uses its stdout — writing forever, writing nothing, or stopping mid-line.
+    On expiry the process is killed and reaped, and TimeoutExpired raised.
     """
-    lines: list[str] = []
+    deadline = time.monotonic() + timeout
+    chunks: list[str] = []
     with subprocess.Popen(
         command,
         cwd=workdir,
         env=env,
-        text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        bufsize=1,
     ) as proc:
+        assert proc.stdout is not None
+        # The reader owns a duplicate of the pipe, so closing `proc.stdout` on
+        # the way out never pulls the descriptor from under a read still
+        # blocked on a pipe some leftover child holds open.
+        reader = threading.Thread(
+            target=_drain, args=(os.dup(proc.stdout.fileno()), chunks, echo), daemon=True
+        )
+        reader.start()
         try:
-            for line in proc.stdout or ():
-                if echo:
-                    sys.stderr.write(line)
-                    sys.stderr.flush()
-                lines.append(line)
-            returncode = proc.wait(timeout=timeout)
+            returncode = proc.wait(timeout=max(deadline - time.monotonic(), 0))
+            # EOF, not exit, is the end of the output: whatever still holds the
+            # pipe open is still part of the run, and the deadline covers it.
+            reader.join(timeout=max(deadline - time.monotonic(), 0))
+            if reader.is_alive():
+                raise subprocess.TimeoutExpired(command, timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
-            raise
-    return returncode, "".join(lines)
+            proc.wait()
+            reader.join(timeout=1)
+            raise subprocess.TimeoutExpired(command, timeout, output="".join(chunks)) from None
+    return returncode, "".join(chunks)
+
+
+def _drain(fd: int, chunks: list[str], echo: bool) -> None:
+    """Read `fd` to EOF in whatever pieces arrive, then close it — a partial
+    line is relayed as soon as it is written, not when its newline turns up."""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    try:
+        while True:
+            data = os.read(fd, 65536)
+            text = decoder.decode(data, final=not data)
+            if text:
+                if echo:
+                    sys.stderr.write(text)
+                    sys.stderr.flush()
+                chunks.append(text)
+            if not data:
+                return
+    finally:
+        os.close(fd)
 
 
 PROBE_TIMEOUT = 120.0

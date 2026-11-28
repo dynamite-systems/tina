@@ -575,7 +575,14 @@ schedule; once its ladder is spent the failure stands. With rules set, the
 harness's output is relayed line by line so the markers can be seen — to
 stderr, since stdout is Tina's JSON records. Without rules the output is
 inherited and the harness runs exactly once. Tina still never *parses* that
-output for an outcome: a marker is a reason to run again, not a report.
+output for an outcome: a marker is a reason to run again, not a report. The
+harness timeout (`TINA_HARNESS_TIMEOUT`, an hour by default) bounds the whole
+run — every attempt and every wait between them — not each attempt, because
+the run holds its claim for as long as it lasts; a wait that would reach the
+deadline is not slept, and the run fails as timed out. It holds while the
+output is relayed, whether the harness writes continuously, writes nothing, or
+stops mid-line: on expiry the process is killed and reaped. A `doctor` probe
+gets the same treatment under its own timeout.
 
 `{session_dir}` is where the harness leaves its session — the transcript, tool
 calls, and token costs the final message never shows. A command referencing it

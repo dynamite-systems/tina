@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -402,6 +403,124 @@ def test_relayed_output_lands_on_stderr(tmp_path: Path, capfd: pytest.CaptureFix
     out, err = capfd.readouterr()
     assert "agent says hello" in err
     assert "agent says hello" not in out, "stdout is Tina's JSON records"
+
+
+# --- the deadline while relaying ----------------------------------------------
+
+#: Rules that never match: they only switch the run onto the relaying path.
+RELAY = [{"markers": ["never-printed"], "waits": [1]}]
+
+
+def pid_file_script(tmp_path: Path, body: str) -> tuple[Path, Path]:
+    """A fake that records its pid, then runs `body` — so a test can check the
+    process was reaped rather than left running."""
+    pid_file = tmp_path / "pid"
+    fake = script(
+        tmp_path,
+        "import os, pathlib, sys, time\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n" + body,
+    )
+    return fake, pid_file
+
+
+def assert_reaped(pid_file: Path) -> None:
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
+
+
+@pytest.mark.parametrize(
+    ("name", "body"),
+    [
+        ("continuous output", "while True:\n    print('still working', flush=True)\n"),
+        ("no output", "time.sleep(30)\n"),
+        ("a partial line", "sys.stdout.write('half a line'); sys.stdout.flush(); time.sleep(30)\n"),
+    ],
+)
+def test_a_relayed_run_is_stopped_at_its_deadline(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str], name: str, body: str
+) -> None:
+    """Reading the output must not outlive the deadline, whatever the harness
+    does with its stdout — the run holds a claim while it lasts."""
+    fake, pid_file = pid_file_script(tmp_path, body)
+
+    started = time.monotonic()
+    result = harness.run(
+        retrying(sys.executable, str(fake), "{prompt_file}", "{outcome_dir}", rules=RELAY),
+        "go",
+        tmp_path / "run",
+        timeout=0.5,
+    )
+
+    assert time.monotonic() - started < 10, f"{name}: the deadline was not enforced"
+    assert result.report.outcome is OutcomeStatus.FAILED
+    assert "timed out after 0.5s" in result.report.details
+    assert result.exit_code is None
+    assert_reaped(pid_file)
+    if name == "a partial line":
+        assert "half a line" in capfd.readouterr().err, "output before the deadline is relayed"
+
+
+def test_the_deadline_covers_the_whole_retry_sequence(tmp_path: Path) -> None:
+    """Every attempt fails with the marker; the ladder is long enough to run for
+    minutes, so only a deadline across attempts stops it."""
+    fake = script(
+        tmp_path, "import time\nprint('overloaded_error')\ntime.sleep(0.2)\nraise SystemExit(1)"
+    )
+    waits: list[float] = []
+
+    started = time.monotonic()
+    result = harness.run(
+        retrying(
+            sys.executable,
+            str(fake),
+            "{prompt_file}",
+            "{outcome_dir}",
+            rules=[{"markers": ["overloaded_error"], "waits": [0] * 1000}],
+        ),
+        "go",
+        tmp_path / "run",
+        timeout=1.0,
+        sleep=waits.append,
+    )
+
+    assert time.monotonic() - started < 10
+    assert "timed out after 1s" in result.report.details
+    assert 0 < len(waits) < 1000
+
+
+def test_a_retry_wait_past_the_deadline_is_not_slept(tmp_path: Path) -> None:
+    fake = script(tmp_path, "print('overloaded_error'); raise SystemExit(1)")
+    waits: list[float] = []
+
+    result = harness.run(
+        retrying(
+            sys.executable,
+            str(fake),
+            "{prompt_file}",
+            "{outcome_dir}",
+            rules=[{"markers": ["overloaded_error"], "waits": [600]}],
+        ),
+        "go",
+        tmp_path / "run",
+        timeout=30,
+        sleep=waits.append,
+    )
+
+    assert "timed out after 30s" in result.report.details
+    assert waits == [], "a wait that outlasts the deadline only delays the verdict"
+
+
+def test_a_probe_is_stopped_at_its_deadline(tmp_path: Path) -> None:
+    fake, pid_file = pid_file_script(
+        tmp_path, "sys.stdout.write('thinking'); sys.stdout.flush(); time.sleep(30)\n"
+    )
+
+    started = time.monotonic()
+    result = harness.probe(config(sys.executable, str(fake), "{prompt_file}"), None, timeout=0.5)
+
+    assert time.monotonic() - started < 10
+    assert result == harness.ProbeResult(ok=False, detail="timed out after 0.5s")
+    assert_reaped(pid_file)
 
 
 # --- capture scrubs ------------------------------------------------------------
