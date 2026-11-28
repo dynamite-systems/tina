@@ -2691,3 +2691,63 @@ def test_a_model_override_must_be_in_the_models_list(
 
     record = cli.run_item(config.load(modelled), "vul", "VUL-1", model="own-model")
     assert record is not None
+
+
+def test_a_jira_claim_lost_to_a_person_starts_no_harness(project: Path) -> None:
+    """A person assigns the issue between the claim's read and its write.
+
+    The real Jira adapter over fake HTTP: Jira's assignee write is
+    unconditional, so the bot's lands on top. The worker hands the issue back
+    and exits no_action_needed without running the agent.
+    """
+    from tina.sources.jira import JiraSource
+
+    state: dict[str, Any] = {"assignee": None, "history": []}
+
+    def assign(author: str, account: str) -> None:
+        state["history"].append(
+            {
+                "id": str(len(state["history"])),
+                "author": {"accountId": author},
+                "items": [{"fieldId": "assignee", "from": state["assignee"], "to": account}],
+            }
+        )
+        state["assignee"] = account
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "PUT":
+            if state["assignee"] is None:
+                assign("person", "person")
+            assign("bot", json.loads(request.content)["accountId"])
+            return httpx.Response(204)
+        if path.endswith("/changelog"):
+            history = state["history"]
+            return httpx.Response(200, json={"total": len(history), "values": history})
+        holder = {"accountId": state["assignee"]} if state["assignee"] else None
+        body = {"key": "VUL-1", "fields": {"summary": "VUL-1", "assignee": holder}}
+        if path.endswith("/search/jql"):
+            return httpx.Response(200, json={"issues": [body]})
+        return httpx.Response(200, json=body)
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the losing worker must not start the harness")
+
+    jira = JiraSource(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://acme.atlassian.net",
+        bot_account_id="bot",
+    )
+    record = cli.run_item(
+        config.load(project),
+        "vul",
+        "VUL-1",
+        source=jira,
+        runner=forbidden,
+        capture=forbidden,
+        verifier=forbidden,
+    )
+
+    assert record is not None
+    assert record.effective_status == OutcomeStatus.NO_ACTION_NEEDED
+    assert state["assignee"] == "person"

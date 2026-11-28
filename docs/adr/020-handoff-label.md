@@ -80,7 +80,7 @@ worker consumed it, and this one exits `no_action_needed`. A claim label
 already on the ticket does not block a handoff claim, because the handoff is
 newer than the old claim.
 Under `claim = "assign"`, the label is consumed and then the usual assignee
-compare-and-set runs, so a ticket another user holds still refuses; with the
+claim runs, so a ticket another user holds still refuses; with the
 label gone, it is not offered again.
 
 **Validation.** `handoff_label` must be one label with no whitespace, set only

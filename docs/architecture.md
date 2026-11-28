@@ -453,7 +453,7 @@ A ticket carrying the track's `handoff_label` is claimed by consuming it: one
 write removes the label and, under `claim = "label"`, adds `claim_label`, and a
 re-read confirms both. A claim label already present does not refuse a
 handoff. Under `claim = "assign"` the label is consumed and then the usual
-assignee compare-and-set runs, so a ticket another user holds still refuses.
+assignee claim runs, so a ticket another user holds still refuses.
 Under `claim = "none"` consuming the label is the whole claim. `claimed()`
 leaves out tickets that still carry the handoff label, since those are queued,
 not held.
@@ -470,10 +470,17 @@ items need human recovery.
 
 Consequence: worker start is `claim() → if already claimed, exit
 no_action_needed`. That check needs to be atomic enough per tracker to not
-double-run. Jira assignment is a real compare-and-set if conditioned on assignee
-being empty. GitHub's assign API is an idempotent add with no conditional, so
-GitHub claiming is racy — mitigate with assign-then-reread, and exit
-`no_action_needed` if not the sole assignee. A small window remains, which is
+double-run. Neither tracker offers a conditional write, so both claims are
+write-then-verify. Jira's assignee write is unconditional and overwrites a
+person who assigned the issue between the claim's read and its write, so the
+claim then reads the issue changelog, which records what each write replaced:
+when the bot's write replaced another account, the claim refuses and reassigns
+that account unless the issue has moved on again. The issue is briefly
+assigned to the bot, but the person keeps it, and the worker exits
+`no_action_needed` without starting the harness. A second worker for the same
+bot writes no change, so both proceed — the tolerated duplicate. GitHub's
+assign API is an idempotent add with no conditional, so GitHub claiming is
+racy — mitigate with assign-then-reread, and exit `no_action_needed` if not the sole assignee. A small window remains, which is
 acceptable because duplicate workers are already the tolerated failure mode.
 
 ---
