@@ -37,7 +37,10 @@ need human recovery.
 - Containers are restartable and multiple invokers are safe by default.
 - Duplicate enqueues are a tolerated, cheap no-op rather than a bug to prevent.
 - The claim must be atomic enough per tracker to not double-run. Jira assignment is
-  a real compare-and-set when conditioned on the assignee being empty. GitHub's
+  not a compare-and-set: the assignee write is unconditional and Jira offers no
+  conditional form. The claim reads, writes, then reads the issue changelog for
+  what its own write replaced; if that was another account, the claim refuses
+  and reassigns it, so a concurrent human assignment survives. GitHub's
   assign API is an idempotent add with no conditional, so GitHub claiming is
   assign-then-reread and exit `no_action_needed` if not the sole assignee.
 - A small race window remains on GitHub. It is acceptable because duplicate workers

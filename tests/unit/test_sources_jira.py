@@ -95,8 +95,9 @@ def test_claim_assigns_then_confirms(work_item: WorkItem) -> None:
         return httpx.Response(200, json=issue(assignee=state["assignee"]))
 
     assert source(handler).claim(work_item) is True
-    assert [method for method, _ in calls] == ["GET", "PUT", "GET"]
+    assert [method for method, _ in calls] == ["GET", "PUT", "GET", "GET"]
     assert calls[1][1] == "/rest/api/3/issue/VUL-1/assignee"
+    assert calls[3][1] == "/rest/api/3/issue/VUL-1/changelog"
 
 
 def test_claim_fails_when_the_write_did_not_stick(work_item: WorkItem) -> None:
@@ -130,6 +131,151 @@ def test_claim_prognosis_reports_the_holder_without_writing(work_item: WorkItem)
     assert (taken.would_claim, taken.holder) == (False, "someone-else")
     assert (unheld.would_claim, unheld.holder) == (True, "")
     assert calls == ["GET", "GET"], "one read each, and nothing else"
+
+
+# --- concurrent assignment: the PUT is unconditional, the changelog is not ---
+
+HUMAN = "human-account-id"
+CHANGELOG_PATH = "/rest/api/3/issue/VUL-1/changelog"
+
+
+def assignee_change(change_id: str, author: str, frm: str | None, to: str | None) -> dict[str, Any]:
+    return {
+        "id": change_id,
+        "author": {"accountId": author},
+        "items": [{"field": "assignee", "fieldId": "assignee", "from": frm, "to": to}],
+    }
+
+
+class FakeJira:
+    """One issue with an assignee and a changelog Jira writes on every change.
+
+    `before_put` runs just ahead of the bot's assignment, which is where a
+    concurrent writer lands between the claim's read and its write.
+    """
+
+    def __init__(self, before_put: Any = None) -> None:
+        self.assignee: str | None = None
+        self.history: list[dict[str, Any]] = []
+        self.puts: list[str | None] = []
+        self.before_put = before_put
+
+    def assign(self, author: str, account: str | None) -> None:
+        if account != self.assignee:
+            change_id = str(10000 + len(self.history))
+            self.history.append(assignee_change(change_id, author, self.assignee, account))
+        self.assignee = account
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            assert request.url.path.endswith("/assignee")
+            account = json.loads(request.content)["accountId"]
+            if self.before_put is not None:
+                self.before_put(self)
+                self.before_put = None
+            self.puts.append(account)
+            self.assign(BOT, account)
+            return httpx.Response(204)
+        if request.url.path == CHANGELOG_PATH:
+            start = int(request.url.params.get("startAt", "0"))
+            size = int(request.url.params.get("maxResults", "100"))
+            page = self.history[start : start + size]
+            return httpx.Response(
+                200,
+                json={
+                    "startAt": start,
+                    "maxResults": size,
+                    "total": len(self.history),
+                    "isLast": start + size >= len(self.history),
+                    "values": page,
+                },
+            )
+        holder = {"accountId": self.assignee} if self.assignee else None
+        return httpx.Response(200, json=issue(assignee=holder))
+
+
+def test_a_concurrent_human_assignment_survives_the_claim(work_item: WorkItem) -> None:
+    """A person assigns the issue between the claim's read and its write.
+
+    Jira's assignee PUT is unconditional, so the bot's write lands on top of
+    the person's. The claim must refuse and hand the issue back to them.
+    """
+    jira = FakeJira(before_put=lambda fake: fake.assign(HUMAN, HUMAN))
+
+    assert source(jira.handler).claim(work_item) is False
+    assert jira.assignee == HUMAN, "the person's assignment is restored"
+    assert jira.puts == [BOT, HUMAN]
+
+
+def test_a_restore_never_overwrites_a_later_assignment(work_item: WorkItem) -> None:
+    """If someone has already moved the issue on, the restore stands down."""
+    jira = FakeJira(before_put=lambda fake: fake.assign(HUMAN, HUMAN))
+    real = jira.handler
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == CHANGELOG_PATH:
+            jira.assign("someone-else", "someone-else")
+        return real(request)
+
+    assert source(handler).claim(work_item) is False
+    assert jira.assignee == "someone-else"
+    assert jira.puts == [BOT]
+
+
+def test_a_duplicate_bot_worker_claims_without_a_restore(work_item: WorkItem) -> None:
+    """Two workers for the same bot: the second write is a no-op on Jira's
+    side and both proceed, the tolerated duplicate-worker race (ADR-004)."""
+    jira = FakeJira(before_put=lambda fake: fake.assign(BOT, BOT))
+
+    assert source(jira.handler).claim(work_item) is True
+    assert jira.assignee == BOT
+    assert jira.puts == [BOT]
+
+
+def test_an_uncontested_claim_reads_the_changelog_and_stands(work_item: WorkItem) -> None:
+    jira = FakeJira()
+
+    assert source(jira.handler).claim(work_item) is True
+    assert jira.puts == [BOT]
+
+
+def test_a_human_handing_the_issue_to_the_bot_is_not_undone(work_item: WorkItem) -> None:
+    """Only a change the bot made counts as its own overwrite."""
+    jira = FakeJira(before_put=lambda fake: fake.assign(HUMAN, HUMAN))
+    real = jira.handler
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = real(request)
+        if request.method == "PUT":
+            # The person then reassigns from themselves to the bot on purpose.
+            jira.history[-1]["author"] = {"accountId": HUMAN}
+        return response
+
+    assert source(handler).claim(work_item) is True
+    assert jira.assignee == BOT
+
+
+def test_the_newest_assignee_change_is_found_past_the_first_page(work_item: WorkItem) -> None:
+    jira = FakeJira(before_put=lambda fake: fake.assign(HUMAN, HUMAN))
+    for n in range(150):
+        jira.history.append({"id": str(n), "author": {"accountId": HUMAN}, "items": []})
+
+    assert source(jira.handler).claim(work_item) is False
+    assert jira.assignee == HUMAN
+
+
+def test_an_unreadable_changelog_stops_the_claim(work_item: WorkItem) -> None:
+    """Without the evidence the claim cannot be confirmed; the harness must not start."""
+    jira = FakeJira()
+    real = jira.handler
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == CHANGELOG_PATH:
+            return httpx.Response(403, text="forbidden")
+        return real(request)
+
+    with pytest.raises(SourceError, match="changelog"):
+        source(handler).claim(work_item)
 
 
 # --- claim policies: assign is idempotent, label is a set add (ADR-014) ------

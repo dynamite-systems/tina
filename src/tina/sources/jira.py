@@ -1,7 +1,9 @@
 """Jira source adapter.
 
-Claiming is a real compare-and-set: assignment is conditioned on the assignee
-being empty, then confirmed by re-reading the issue.
+Jira has no conditional assignment: the assignee `PUT` overwrites whoever holds
+the issue. Claiming reads first, writes, then reads the issue's changelog to
+learn what its own write replaced, and hands the issue back when that was
+someone else.
 """
 
 from __future__ import annotations
@@ -32,6 +34,8 @@ log = get_logger(__name__)
 SEARCH_PATH = "/rest/api/3/search/jql"
 ISSUE_PATH = "/rest/api/3/issue"
 MYSELF_PATH = "/rest/api/3/myself"
+#: The changelog endpoint pages oldest first.
+CHANGELOG_PAGE = 100
 FIELDS = ["summary", "description", "assignee", "status", "labels"]
 
 #: Server errors get a short ladder. A rate limit is retried once, honoring
@@ -126,6 +130,27 @@ class TransitionList(BaseModel):
     transitions: list[Transition] = Field(default_factory=list)
 
 
+class ChangeItem(BaseModel):
+    """One field change. For a user field, `from`/`to` are account ids."""
+
+    field: str = ""
+    field_id: str = Field(default="", alias="fieldId")
+    from_: str | None = Field(default=None, alias="from")
+    to: str | None = None
+
+
+class Change(BaseModel):
+    author: User | None = None
+    items: list[ChangeItem] = Field(default_factory=list)
+
+
+class ChangelogPage(BaseModel):
+    """`GET /rest/api/3/issue/{key}/changelog`, oldest first."""
+
+    total: int = 0
+    values: list[Change] = Field(default_factory=list)
+
+
 class JiraSource:
     """Jira Cloud REST API v3."""
 
@@ -194,12 +219,13 @@ class JiraSource:
     def claim(self, item: WorkItem) -> bool:
         """Take the item under the track's claim policy (ADR-014).
 
-        Assign is a compare-and-set on the assignee field: refuse anyone else,
-        assign to the bot, re-read to confirm the write landed. An issue the
-        bot already holds re-claims successfully. A label claim is the same
-        shape with the claim label in place of the assignee — except that a
-        label carries no identity, so present always refuses. Under `none`
-        there is nothing to take. An issue carrying the track's handoff label
+        Assign refuses anyone else, assigns the bot, re-reads to confirm the
+        write landed, then checks the changelog for what that unconditional
+        write replaced (`_overwrote`). An issue the bot already holds
+        re-claims successfully. A label claim is the same shape with the
+        claim label in place of the assignee — except that a label carries
+        no identity, so present always refuses. Under `none` there is nothing
+        to take. An issue carrying the track's handoff label
         is claimed by consuming it (ADR-020). Either way, a confirmed claim
         then applies `claim_transition` when the track set one.
         """
@@ -228,7 +254,58 @@ class JiraSource:
         )
 
         assignee = self._issue(item.id).fields.assignee
-        return assignee is not None and assignee.account_id == self.bot_account_id
+        if assignee is None or assignee.account_id != self.bot_account_id:
+            return False
+        return not self._overwrote(item)
+
+    def _overwrote(self, item: WorkItem) -> bool:
+        """Did the bot's assignment replace someone who took the issue after
+        the claim's first read? If so, hand it back to them.
+
+        Jira offers no conditional assignment, so the race cannot be closed
+        before the write; the changelog records, server-side, what each write
+        replaced. The newest assignee change the bot authored that made the
+        bot the assignee is that write. If it replaced another account, the
+        claim loses and that account is reassigned, unless the issue has
+        moved on again since. A second worker for the same bot writes no
+        change, so duplicate workers still both proceed (ADR-004). A failed
+        read raises: an unconfirmed claim must not start the harness.
+        """
+        path = f"{ISSUE_PATH}/{item.id}/changelog"
+        page = parse_payload(
+            ChangelogPage,
+            self._request("GET", path, params={"startAt": 0, "maxResults": CHANGELOG_PAGE}),
+            "jira",
+            path,
+        )
+        if page.values and page.total > len(page.values):
+            # The last page, at whatever page size Jira actually served.
+            start = page.total - len(page.values)
+            response = self._request(
+                "GET", path, params={"startAt": start, "maxResults": CHANGELOG_PAGE}
+            )
+            page = parse_payload(ChangelogPage, response, "jira", path)
+        latest = next(
+            (
+                change_item
+                for change in reversed(page.values)
+                for change_item in reversed(change.items)
+                if "assignee" in (change_item.field_id, change_item.field)
+                and change_item.to == self.bot_account_id
+                and change.author is not None
+                and change.author.account_id == self.bot_account_id
+            ),
+            None,
+        )
+        previous = latest.from_ if latest else None
+        if not previous or previous == self.bot_account_id:
+            return False
+
+        log.warning("claim overwrote an assignee", extra={"item": item.id, "assignee": previous})
+        assignee = self._issue(item.id).fields.assignee
+        if assignee is not None and assignee.account_id == self.bot_account_id:
+            self._request("PUT", f"{ISSUE_PATH}/{item.id}/assignee", json={"accountId": previous})
+        return True
 
     def _claim_by_label(self, item: WorkItem) -> bool:
         if self.claim_label in self._issue(item.id).fields.labels:
@@ -253,9 +330,9 @@ class JiraSource:
         One `PUT` removes the handoff label and, under a label claim, adds the
         claim label, so the issue is never left with neither. A claim label
         already present does not refuse: the handoff is the newer instruction.
-        Under assign the label is consumed first and the assignee
-        compare-and-set runs as usual, so a ticket another user holds still
-        refuses, and is not offered again.
+        Under assign the label is consumed first and the assignee claim runs
+        as usual, so a ticket another user holds still refuses, and is not
+        offered again.
         """
         edits: list[dict[str, str]] = [{"remove": str(self.handoff_label)}]
         if self.claim_policy == "label":

@@ -21,9 +21,9 @@ class ClaimPrognosis(BaseModel):
     """What `claim` would do right now, established without doing it.
 
     The adapter owns the verdict because claim semantics differ: Jira's
-    compare-and-set refuses any existing assignee, including the bot itself,
-    while GitHub's idempotent add succeeds when the bot is already the sole
-    one. A caller that decided this for itself would have to know both.
+    assign claim refuses any assignee other than the bot, while GitHub's
+    idempotent add succeeds when the bot is already the sole one. A caller
+    that decided this for itself would have to know both.
 
     `holder` is `""` when nobody holds the item — the same convention the
     dispatch log line uses for a missing URL, rather than a null.
