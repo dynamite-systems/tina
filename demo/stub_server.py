@@ -84,6 +84,7 @@ def issue_payload(base_url: str, number: int) -> dict[str, Any]:
         "title": ISSUES.get(number, "Unknown issue"),
         "body": "Reported by a customer. Reproducible on main.",
         "html_url": f"{base_url}/{REPO}/issues/{number}",
+        "repository_url": f"{base_url}/repos/{REPO}",
         "assignees": [{"login": login} for login in assigned.get(number, [])],
     }
 

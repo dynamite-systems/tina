@@ -78,6 +78,9 @@ class Issue(BaseModel):
     body: str | None = None
     state: str = ""
     html_url: AnyHttpUrl | None = None
+    #: `{api}/repos/owner/name` — which repo the issue lives in. Search spans
+    #: repos, so a result's number means nothing without it.
+    repository_url: str | None = None
     assignees: list[User] = Field(default_factory=list)
     labels: list[Label] = Field(default_factory=list)
     #: The payload this was validated from, kept for `WorkItem.raw`.
@@ -167,10 +170,12 @@ class GitHubSource:
         params = SearchParams(q=q)
         response = self._request("GET", SEARCH_PATH, params=params.model_dump())
         result = parse_payload(SearchResult, response, "github", SEARCH_PATH)
+        for issue in result.items:
+            self._check_repository(issue)
         return [self._to_item(issue) for issue in result.items]
 
     def get(self, item_id: str) -> WorkItem:
-        return self._to_item(self._issue(_number(item_id)))
+        return self._to_item(self._issue(_number(item_id, self.repo)))
 
     def matches(self, item_id: str, q: str) -> bool:
         """Fetch the issue and re-check the query's structured qualifiers.
@@ -181,7 +186,7 @@ class GitHubSource:
         (`repo:`, `is:issue`) were true at dispatch and cannot silently change,
         so they pass.
         """
-        return _matches_qualifiers(self._issue(_number(item_id)), q)
+        return _matches_qualifiers(self._issue(_number(item_id, self.repo)), q)
 
     def claim(self, item: WorkItem) -> bool:
         """Take the item under the track's claim policy (ADR-014).
@@ -193,7 +198,7 @@ class GitHubSource:
         """
         if self.claim_policy == "label":
             return self._claim_by_label(item)
-        number = _number(item.id)
+        number = _number(item.id, self.repo)
         self._request(
             "POST",
             f"/repos/{self.repo}/issues/{number}/assignees",
@@ -202,7 +207,7 @@ class GitHubSource:
         return self._issue(number).logins == [self.bot_login]
 
     def _claim_by_label(self, item: WorkItem) -> bool:
-        number = _number(item.id)
+        number = _number(item.id, self.repo)
         if self.claim_label in self._issue(number).label_names:
             return False
 
@@ -223,7 +228,7 @@ class GitHubSource:
         whoever put it there. `bot_login` may cost a `GET /user`; still no
         write.
         """
-        issue = self._issue(_number(item.id))
+        issue = self._issue(_number(item.id, self.repo))
         if self.claim_policy == "label":
             if self.claim_label in issue.label_names:
                 return ClaimPrognosis(would_claim=False, holder=f"label:{self.claim_label}")
@@ -255,7 +260,7 @@ class GitHubSource:
         try:
             self._request(
                 "POST",
-                f"/repos/{self.repo}/issues/{_number(item.id)}/comments",
+                f"/repos/{self.repo}/issues/{_number(item.id, self.repo)}/comments",
                 json={"body": comment},
             )
         except SourceError as exc:
@@ -273,13 +278,29 @@ class GitHubSource:
         try:
             self._request(
                 "POST",
-                f"/repos/{self.repo}/issues/{_number(item.id)}/labels",
+                f"/repos/{self.repo}/issues/{_number(item.id, self.repo)}/labels",
                 json={"labels": [self.blocked_label]},
             )
         except SourceError as exc:
             log.warning("block failed", extra={"item": item.id, "error": str(exc)})
             return
         log.info("item blocked", extra={"item": item.id, "label": self.blocked_label})
+
+    def _check_repository(self, issue: Issue) -> None:
+        """Refuse a search result from any repo but the track's.
+
+        `_to_item` names an item by the track's repo, so a foreign result would
+        otherwise become a same-number issue here — claimed and written to in
+        the wrong place. A result that does not say where it lives cannot be
+        told apart from one that does not belong, so it is refused too.
+        """
+        repo = (issue.repository_url or "").rpartition("/repos/")[2]
+        if repo.lower() != self.repo.lower():
+            raise SourceError(
+                f"github: search returned {repo or 'an issue with no repository'}"
+                f"#{issue.number}, outside the track's repo {self.repo}",
+                fix=f"Add `repo:{self.repo}` to the track query.",
+            )
 
     def _issue(self, number: str) -> Issue:
         path = f"/repos/{self.repo}/issues/{number}"
@@ -406,6 +427,14 @@ def _label_values(token: str) -> set[str]:
     return {part.strip('"').lower() for part in token.split(":", 1)[1].split(",") if part}
 
 
-def _number(item_id: str) -> str:
-    """Accept `123`, `#123`, or `owner/name#123` — all mean issue 123."""
-    return item_id.rsplit("#", 1)[-1].lstrip("#").strip()
+def _number(item_id: str, repo: str) -> str:
+    """Accept `123`, `#123`, or `repo#123` — all mean issue 123 of `repo`.
+
+    A qualified id naming another repo is refused before any request: the
+    adapter only ever addresses `repo`, so honoring the number alone would
+    read or write a different issue that happens to share it.
+    """
+    qualifier, _, number = item_id.strip().rpartition("#")
+    if qualifier and qualifier.lower() != repo.lower():
+        raise SourceError(f"github: {item_id} is not in the track's repo {repo}")
+    return number.strip()
