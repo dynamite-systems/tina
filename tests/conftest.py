@@ -7,6 +7,9 @@ import pytest
 
 from tina.models import WorkItem
 
+#: tests/unit/test_clean_env.py runs clean_env in a child session.
+pytest_plugins = ["pytester"]
+
 Handler = Callable[[httpx.Request], httpx.Response]
 
 
@@ -44,6 +47,7 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "GITHUB_TOKEN_COMMAND",
         "GITHUB_BOT_LOGIN",
         "GITHUB_API_URL",
+        "TINA_CONFIG",
         "TINA_HARNESS_TIMEOUT",
         "TINA_TRACKS_DIR",
         "TINA_ARTIFACTS_DIR",
