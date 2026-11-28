@@ -404,6 +404,22 @@ def test_relayed_output_lands_on_stderr(tmp_path: Path, capfd: pytest.CaptureFix
     assert "agent says hello" not in out, "stdout is Tina's JSON records"
 
 
+def test_unrelayed_output_also_lands_on_stderr(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    fake = script(tmp_path, "print('agent says hello'); raise SystemExit(0)")
+
+    harness.run(
+        retrying(sys.executable, str(fake), "{prompt_file}", "{outcome_dir}", rules=[]),
+        "go",
+        tmp_path / "run",
+    )
+
+    out, err = capfd.readouterr()
+    assert "agent says hello" in err
+    assert "agent says hello" not in out, "stdout is Tina's JSON records"
+
+
 # --- capture scrubs ------------------------------------------------------------
 
 
