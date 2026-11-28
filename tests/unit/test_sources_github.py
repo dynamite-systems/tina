@@ -26,12 +26,14 @@ def issue(
     assignees: list[str] | None = None,
     labels: list[str] | None = None,
     state: str = "open",
+    repo: str = REPO,
 ) -> dict[str, Any]:
     return {
         "number": number,
         "title": "crash on startup",
         "body": "stack trace follows",
-        "html_url": f"https://github.com/{REPO}/issues/{number}",
+        "html_url": f"https://github.com/{repo}/issues/{number}",
+        "repository_url": f"https://api.github.com/repos/{repo}",
         "assignees": [{"login": login} for login in assignees or []],
         "labels": [{"name": name} for name in labels or []],
         "state": state,
@@ -144,6 +146,100 @@ def test_item_ids_are_accepted_in_several_shapes(item_id: str) -> None:
         return httpx.Response(200, json=issue())
 
     assert source(handler).get(item_id).id == "acme/api#42"
+
+
+# --- repository identity: an id never silently changes repo (#79) -----------
+
+FOREIGN_ID = "other/repo#42"
+
+
+def refuse_http(request: httpx.Request) -> httpx.Response:
+    raise AssertionError(f"no request may be sent: {request.method} {request.url.path}")
+
+
+def test_a_matching_qualified_id_is_case_insensitive() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=issue())
+
+    assert source(handler).get("ACME/Api#42").id == "acme/api#42"
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda github: github.get(FOREIGN_ID),
+        lambda github: github.matches(FOREIGN_ID, "repo:acme/api is:open"),
+        lambda github: github.claim(WorkItem(id=FOREIGN_ID, source="github")),
+        lambda github: github.claim_prognosis(WorkItem(id=FOREIGN_ID, source="github")),
+    ],
+)
+def test_a_foreign_qualified_id_is_refused_before_any_request(call) -> None:
+    """`other/repo#42` is not `acme/api#42`; it must not read or claim it."""
+    with pytest.raises(SourceError, match="other/repo#42.*acme/api"):
+        call(source(refuse_http))
+
+
+def test_a_foreign_qualified_id_is_refused_by_a_label_claim() -> None:
+    github = source(refuse_http, claim_policy="label", claim_label="bot-claimed")
+    with pytest.raises(SourceError, match="other/repo"):
+        github.claim(WorkItem(id=FOREIGN_ID, source="github"))
+
+
+def test_write_back_to_a_foreign_qualified_id_sends_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Best-effort write-back still logs rather than raises, but writes nowhere."""
+    foreign = WorkItem(id=FOREIGN_ID, source="github")
+    github = source(refuse_http)
+
+    with caplog.at_level(logging.WARNING):
+        github.annotate(foreign, "run ended failed")
+        github.block(foreign)
+
+    messages = [record.message for record in caplog.records]
+    assert "annotate failed" in messages
+    assert "block failed" in messages
+
+
+def test_a_foreign_search_result_is_refused() -> None:
+    """A result from another repo must not be relabelled as this repo's issue."""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"items": [issue(), issue(repo="other/repo")]})
+
+    with pytest.raises(SourceError, match="other/repo"):
+        source(handler).query("is:open no:assignee")
+
+    assert calls == ["/search/issues"], "nothing past the search itself"
+
+
+def test_a_search_result_without_its_repository_is_refused() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = issue()
+        del payload["repository_url"]
+        return httpx.Response(200, json={"items": [payload]})
+
+    with pytest.raises(SourceError, match="repository"):
+        source(handler).query("repo:acme/api is:open")
+
+
+def test_a_search_result_names_its_repository_case_insensitively() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"items": [issue(repo="Acme/API")]})
+
+    assert [i.id for i in source(handler).query("repo:acme/api")] == ["acme/api#42"]
+
+
+def test_a_github_enterprise_repository_url_is_understood() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = issue()
+        payload["repository_url"] = f"https://ghe.example/api/v3/repos/{REPO}"
+        return httpx.Response(200, json={"items": [payload]})
+
+    github = source(handler, api_base="https://ghe.example/api/v3")
+    assert [i.id for i in github.query("repo:acme/api")] == ["acme/api#42"]
 
 
 def test_repo_is_required() -> None:
